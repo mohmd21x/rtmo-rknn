@@ -28,26 +28,32 @@ from onnx import numpy_helper
 # ---------------------------------------------------------------------------
 # Pre-NMS cut points  (verified by shape-inference on both model files)
 # Output shapes after cut, for a 640×640 input:
-#   bboxes    (1, 2000, 4)
-#   scores    (1, 2000, 1)
-#   pose_vecs (1, 2000, C)   C=256 for -s, 384 for -m
-#   kpt_vis   (1, 2000, 17)
-#   priors    (1, 2000, 2)
+#   bboxes        (1, 2000, 4)   NMS boxes tensor (score-sorted anchor order)
+#   scores        (1, 1, 2000)   NMS scores tensor (matches bboxes)
+#   pose_vecs     (1, 2000, C)   raw anchor order — reorder with sort_indices
+#   kpt_vis       (1, 2000, 17)  raw anchor order — reorder with sort_indices
+#   priors        (1, 2000, 2)   raw anchor order — not used for CPU DCC decode
+#   sort_indices  (1, 2000)      topk_inds: raw anchor index for each sorted slot
+#
+# NOTE: Do NOT cut at y.3 / onnx::Transpose_* — those are misaligned with each
+# other.  Use the same tensors fed to NonMaxSuppression (boxes, scores).
 # ---------------------------------------------------------------------------
 CUT_TENSORS: Dict[str, Dict[str, str]] = {
     "rtmo-s": {
-        "bboxes":    "y.3",
-        "scores":    "onnx::Transpose_1225",
-        "pose_vecs": "onnx::Shape_1089",
-        "kpt_vis":   "onnx::Shape_1117",
-        "priors":    "onnx::Add_1125",
+        "bboxes":        "boxes",
+        "scores":        "scores",
+        "pose_vecs":     "onnx::Shape_1089",
+        "kpt_vis":       "onnx::Shape_1117",
+        "priors":        "onnx::Add_1125",
+        "sort_indices":  "topk_inds",
     },
     "rtmo-m": {
-        "bboxes":    "y.3",
-        "scores":    "onnx::Transpose_1412",
-        "pose_vecs": "onnx::Shape_1276",
-        "kpt_vis":   "onnx::Shape_1304",
-        "priors":    "onnx::Add_1312",
+        "bboxes":        "boxes",
+        "scores":        "scores",
+        "pose_vecs":     "onnx::Shape_1276",
+        "kpt_vis":       "onnx::Shape_1304",
+        "priors":        "onnx::Add_1312",
+        "sort_indices":  "topk_inds",
     },
 }
 
@@ -63,8 +69,8 @@ CUT_TENSORS: Dict[str, Dict[str, str]] = {
 #   pose_to_kpts_weight  rtmo-s (256,2176)  rtmo-m (384,2176)   → transpose
 #   gau_uv_weight        both   (128, 640)                       → transpose
 #   gau_o_weight         both   (256, 128)                       → transpose
-#   x_fc_weight          both   (128, 128)                       no transform
-#   y_fc_weight          both   (128, 128)                       no transform
+#   x_fc_weight          both   (128, 128)                       → transpose
+#   y_fc_weight          both   (128, 128)                       → transpose
 # ---------------------------------------------------------------------------
 DCC_INIT: Dict[str, Dict[str, str]] = {
     "rtmo-s": {
@@ -226,9 +232,9 @@ def extract_decoder_yaml(
 
     # ── weights that need no transposing ─────────────────────────────────
     pose_to_kpts_b = g("pose_to_kpts_bias").reshape(-1, 1)  # (2176,1)
-    x_fc_w         = g("x_fc_weight")                        # (128,128)
+    x_fc_w         = g("x_fc_weight").T                      # (128,128)→(128,128) row-major
     x_fc_b         = g("x_fc_bias").reshape(-1, 1)           # (128,1)
-    y_fc_w         = g("y_fc_weight")                        # (128,128)
+    y_fc_w         = g("y_fc_weight").T                      # (128,128)→(128,128) row-major
     y_fc_b         = g("y_fc_bias").reshape(-1, 1)           # (128,1)
     gau_ln_g       = g("gau_ln_g").reshape(1, 1)             # (1,1)
     gau_res_scale  = g("gau_res_scale").reshape(-1, 1)       # (128,1)

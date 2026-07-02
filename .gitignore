@@ -18,10 +18,13 @@
 !convert/*.sh
 !convert/decoder/
 !convert/decoder/*.yml
+!convert/models/
+!convert/models/*.rknn
 
 # test (script only; not output videos)
 !test/
 !test/compare_video.py
+!test/check_board_ready.py
 
 # INT8 calibration images
 !sample-data/
@@ -48,8 +51,12 @@ venv/
 
 # RKNN / ONNX build outputs (regenerate with convert/)
 convert/no_nms_onnx/
-convert/models/
+convert/models/dataset.txt
 convert/**/*.tmp
+
+# Pre-built RKNN models (tracked — whitelist below)
+!convert/models/
+!convert/models/*.rknn
 
 # Root-level RKNN toolkit temp checkpoints
 /check*.onnx

@@ -7,6 +7,9 @@ import cv2
 import numpy as np
 
 NUM_KEYPOINTS = 17
+# Embedded ONNX NonMaxSuppression uses 0.15; rtmo_gpu.postprocess keeps score > 0.3.
+ONNX_NMS_SCORE_THRESHOLD = 0.15
+ONNX_OUTPUT_SCORE_THRESHOLD = 0.3
 _SCALAR_RE = re.compile(r"^([A-Za-z0-9_]+):\s*(.+?)\s*$")
 _MATRIX_HEADER_RE = re.compile(r"^([A-Za-z0-9_]+):\s*!!opencv-matrix\s*$")
 
@@ -445,30 +448,68 @@ def _nms_xyxy(
     scores = scores[keep_mask]
     orig_indices = np.nonzero(keep_mask)[0]
 
-    boxes_xywh = boxes.copy()
-    boxes_xywh[:, 2] = boxes[:, 2] - boxes[:, 0]
-    boxes_xywh[:, 3] = boxes[:, 3] - boxes[:, 1]
-
-    selected: List[int]
-    if hasattr(cv2, "dnn") and hasattr(cv2.dnn, "NMSBoxes"):
-        indices = cv2.dnn.NMSBoxes(
-            boxes_xywh.tolist(),
-            scores.tolist(),
-            score_threshold,
-            iou_threshold,
-            top_k=max_detections,
-        )
-        if len(indices) == 0:
-            return []
-        if isinstance(indices, np.ndarray):
-            flat = indices.reshape(-1)
-        else:
-            flat = np.array(indices).reshape(-1)
-        selected = [int(i) for i in flat]
-    else:
-        selected = _nms_xyxy_numpy(boxes, scores, iou_threshold, max_detections)
-
+    selected = _nms_xyxy_numpy(boxes, scores, iou_threshold, max_detections)
     return [int(orig_indices[i]) for i in selected]
+
+
+def _reorder_by_sort_indices(
+    tensor: np.ndarray, sort_indices: np.ndarray
+) -> np.ndarray:
+    """Map raw-anchor tensors into the same order as boxes/scores."""
+    order = np.asarray(sort_indices, dtype=np.int64).reshape(-1)
+    if order.size == 0:
+        return tensor
+    if order.size > 0 and int(order.max()) >= tensor.shape[0]:
+        raise ValueError(
+            f"sort_indices max {int(order.max())} out of range for "
+            f"{tensor.shape[0]} candidates"
+        )
+    return tensor[order]
+
+
+def _outputs_to_dict(
+    outputs: List[np.ndarray], output_names: Optional[List[str]]
+) -> Dict[str, np.ndarray]:
+    if output_names is None:
+        default_names = [
+            "bboxes",
+            "scores",
+            "pose_vecs",
+            "kpt_vis",
+            "priors",
+            "sort_indices",
+        ]
+        output_names = default_names[: len(outputs)]
+    if len(output_names) != len(outputs):
+        raise ValueError(
+            f"Output name count {len(output_names)} does not match "
+            f"tensor count {len(outputs)}"
+        )
+    return {name: out for name, out in zip(output_names, outputs)}
+
+
+def match_detections_by_iou(
+    onnx_boxes: np.ndarray,
+    rknn_boxes: np.ndarray,
+    iou_threshold: float = 0.3,
+) -> List[Tuple[int, int, float]]:
+    """Greedy IoU matching: ONNX index -> RKNN index."""
+    pairs: List[Tuple[int, int, float]] = []
+    used_rknn: set = set()
+    for onnx_idx, onnx_box in enumerate(np.asarray(onnx_boxes, dtype=np.float32).reshape(-1, 4)):
+        best_rknn_idx = -1
+        best_iou = 0.0
+        for rknn_idx, rknn_box in enumerate(np.asarray(rknn_boxes, dtype=np.float32).reshape(-1, 4)):
+            if rknn_idx in used_rknn:
+                continue
+            iou = _iou_xyxy(onnx_box, rknn_box)
+            if iou > best_iou:
+                best_iou = iou
+                best_rknn_idx = rknn_idx
+        if best_rknn_idx >= 0 and best_iou >= iou_threshold:
+            pairs.append((onnx_idx, best_rknn_idx, best_iou))
+            used_rknn.add(best_rknn_idx)
+    return pairs
 
 
 class RTMO_RKNN:
@@ -478,7 +519,9 @@ class RTMO_RKNN:
         target: str = "rk3588",
         device_id: int = 0,
         use_simulator: bool = True,
-        score_threshold: float = 0.15,
+        backend: Optional[str] = None,
+        score_threshold: float = ONNX_OUTPUT_SCORE_THRESHOLD,
+        nms_score_threshold: float = ONNX_NMS_SCORE_THRESHOLD,
         nms_iou: float = 0.65,
         nms_max: int = 200,
         model_input_size: Tuple[int, int] = (640, 640),
@@ -492,8 +535,17 @@ class RTMO_RKNN:
         self.model_path = model_path
         self.target = target
         self.device_id = str(device_id)
-        self.use_simulator = use_simulator
+        if backend is None:
+            backend = "simulator" if use_simulator else "device"
+        backend = backend.lower()
+        if backend not in {"simulator", "onnx", "device"}:
+            raise ValueError(
+                f"Invalid backend={backend!r}. Use 'simulator', 'onnx', or 'device'."
+            )
+        self.backend = backend
+        self.use_simulator = backend == "simulator"
         self.score_threshold = score_threshold
+        self.nms_score_threshold = nms_score_threshold
         self.nms_iou = nms_iou
         self.nms_max = nms_max
         self.model_input_size = model_input_size
@@ -503,6 +555,8 @@ class RTMO_RKNN:
             Path(sample_data) if sample_data else repo_root / "sample-data"
         )
         self.rknn = None
+        self.onnx_session = None
+        self.onnx_output_names: Optional[List[str]] = None
 
         decoder_path = _resolve_decoder_params(model_path, decoder_params)
         self.decoder = DCCDecoder(str(decoder_path))
@@ -526,6 +580,7 @@ class RTMO_RKNN:
             mean_values=[[0, 0, 0]],
             std_values=[[255, 255, 255]],
             target_platform=self.target,
+            output_optimize=False,
         )
         if ret != 0:
             raise RuntimeError(f"RKNN.config failed with ret={ret}")
@@ -555,7 +610,25 @@ class RTMO_RKNN:
         if ret != 0:
             raise RuntimeError(f"Failed to init RKNN simulator runtime: ret={ret}")
 
+    def _init_onnx_backend(self) -> None:
+        import onnxruntime as ort
+
+        onnx_path = _resolve_no_nms_onnx(self.model_path, self.rknn_onnx)
+        if not onnx_path.exists():
+            raise FileNotFoundError(
+                "ONNX backend requires a no-NMS ONNX export.\n"
+                f"Expected ONNX path: {onnx_path}\n"
+                "Run: python convert/export_no_nms.py --model rtmo/rtmo-<s|m>.onnx"
+            )
+        self.onnx_session = ort.InferenceSession(
+            str(onnx_path), providers=["CPUExecutionProvider"]
+        )
+        self.onnx_output_names = [o.name for o in self.onnx_session.get_outputs()]
+
     def _init_runtime(self) -> None:
+        if self.backend == "onnx":
+            self._init_onnx_backend()
+            return
         if self.use_simulator:
             try:
                 from rknn.api import RKNN
@@ -609,6 +682,10 @@ class RTMO_RKNN:
     def inference(self, img: np.ndarray) -> List[np.ndarray]:
         if img.ndim == 3:
             img = np.expand_dims(img, axis=0)
+        if self.backend == "onnx":
+            inp = np.ascontiguousarray(img.transpose(0, 3, 1, 2), dtype=np.float32)
+            outputs = self.onnx_session.run(None, {"input": inp})
+            return outputs
         try:
             outputs = self.rknn.inference(inputs=[img], data_format=["nhwc"])
         except TypeError:
@@ -617,29 +694,48 @@ class RTMO_RKNN:
 
     def _parse_no_nms_outputs(
         self, outputs: List[np.ndarray]
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        if len(outputs) != 5:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        output_names = (
+            self.onnx_output_names if self.backend == "onnx" else None
+        )
+        parsed = _outputs_to_dict(outputs, output_names)
+
+        if len(parsed) not in {5, 6}:
             raise ValueError(
-                f"Expected 5 RKNN outputs (bboxes, scores, pose_vecs, kpt_vis, priors), "
-                f"got {len(outputs)}. Convert a no-NMS ONNX model first "
-                f"(python convert/export_no_nms.py)."
+                f"Expected 5 or 6 RKNN outputs, got {len(parsed)}. "
+                "Re-export no-NMS ONNX with convert/export_no_nms.py."
+            )
+        if len(parsed) == 5:
+            raise ValueError(
+                "This no-NMS ONNX was exported with misaligned cut points "
+                "(y.3 / Transpose scores). Re-export with:\n"
+                "  python convert/export_no_nms.py --model rtmo/rtmo-<s|m>.onnx"
             )
 
-        bboxes = np.asarray(outputs[0], dtype=np.float32).reshape(-1, 4)
-        scores = np.asarray(outputs[1], dtype=np.float32).reshape(-1)
-        pose_vecs = np.asarray(outputs[2], dtype=np.float32).reshape(
+        bboxes = np.asarray(parsed["bboxes"], dtype=np.float32).reshape(-1, 4)
+        scores = np.asarray(parsed["scores"], dtype=np.float32).reshape(-1)
+        pose_vecs = np.asarray(parsed["pose_vecs"], dtype=np.float32).reshape(
             bboxes.shape[0], -1
         )
-        kpt_vis = np.asarray(outputs[3], dtype=np.float32).reshape(
+        kpt_vis = np.asarray(parsed["kpt_vis"], dtype=np.float32).reshape(
             bboxes.shape[0], NUM_KEYPOINTS
         )
-        priors = np.asarray(outputs[4], dtype=np.float32).reshape(bboxes.shape[0], 2)
-        return bboxes, scores, pose_vecs, kpt_vis, priors
+        priors = np.asarray(parsed["priors"], dtype=np.float32).reshape(
+            bboxes.shape[0], 2
+        )
+        sort_indices = np.asarray(parsed["sort_indices"], dtype=np.int64).reshape(-1)
+
+        pose_vecs = _reorder_by_sort_indices(pose_vecs, sort_indices)
+        kpt_vis = _reorder_by_sort_indices(kpt_vis, sort_indices)
+        priors = _reorder_by_sort_indices(priors, sort_indices)
+        return bboxes, scores, pose_vecs, kpt_vis, priors, sort_indices
 
     def postprocess(
         self, outputs: List[np.ndarray], ratio: float = 1.0
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        bboxes, scores, pose_vecs, kpt_vis, priors = self._parse_no_nms_outputs(outputs)
+        bboxes, scores, pose_vecs, kpt_vis, _priors, sort_indices = (
+            self._parse_no_nms_outputs(outputs)
+        )
 
         if pose_vecs.shape[1] != self.decoder.in_channels:
             raise ValueError(
@@ -647,13 +743,19 @@ class RTMO_RKNN:
                 f"in_channels {self.decoder.in_channels}"
             )
 
-        kept = _nms_xyxy(
+        # DCC decode needs static grid priors (flatten_priors_640), indexed by the
+        # raw anchor id from sort_indices. The network "priors" output (Add_1312)
+        # is an offset bbox tensor and must not be used here.
+        flatten_priors = self.decoder.flatten_priors_640.reshape(-1, 2)
+
+        nms_kept = _nms_xyxy(
             bboxes,
             scores,
-            self.score_threshold,
+            self.nms_score_threshold,
             self.nms_iou,
             self.nms_max,
         )
+        kept = [idx for idx in nms_kept if scores[idx] >= self.score_threshold]
         if not kept:
             return (
                 np.zeros((0, 4), dtype=np.float32),
@@ -668,9 +770,13 @@ class RTMO_RKNN:
 
         keypoints = []
         for idx in kept:
-            prior = priors[idx]
-            if prior.size == 0:
-                prior = self.decoder.flatten_priors_640.reshape(-1, 2)[idx]
+            raw_idx = int(sort_indices[idx])
+            if raw_idx < 0 or raw_idx >= flatten_priors.shape[0]:
+                raise ValueError(
+                    f"sort_indices[{idx}]={raw_idx} out of range for "
+                    f"{flatten_priors.shape[0]} flatten_priors entries"
+                )
+            prior = flatten_priors[raw_idx]
             kpts_640 = self.decoder.decode(pose_vecs[idx], prior, bboxes[idx])
             keypoints.append(kpts_640 / ratio)
 
@@ -689,3 +795,5 @@ class RTMO_RKNN:
     def release(self) -> None:
         if self.rknn is not None:
             self.rknn.release()
+        self.onnx_session = None
+        self.onnx_output_names = None

@@ -28,6 +28,7 @@ for model in rtmo-s rtmo-m; do
       --output "${output_model}" \
       --quant "${quant}" \
       --target "${TARGET}" \
+      --keep_float_io \
       --sample_data "${SAMPLE_DATA}"
   done
 done

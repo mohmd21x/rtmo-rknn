@@ -52,6 +52,16 @@ def parse_args() -> argparse.Namespace:
         default="640,640",
         help="Static input size as H,W (e.g. 640,640)",
     )
+    parser.add_argument(
+        "--keep_float_io",
+        action="store_true",
+        default=False,
+        help=(
+            "Keep model outputs as float32 (sets output_optimize=0 in rknn.config). "
+            "Prevents the compiler changing output dtypes from float32 to int8. "
+            "Useful when the board runtime auto-dequantization causes issues."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -144,11 +154,18 @@ def main() -> None:
     rknn = RKNN(verbose=True)
     try:
         print(f"[INFO] Configuring RKNN for target={args.target}")
-        ret = rknn.config(
+        config_kwargs: dict = dict(
             mean_values=[[0, 0, 0]],
             std_values=[[255, 255, 255]],
             target_platform=args.target,
         )
+        if args.keep_float_io:
+            # output_optimize=0 prevents the compiler from changing output dtypes
+            # from float32 to int8 for "performance". Input stays uint8 NHWC (raw
+            # image) because mean/std normalization is baked into the RKNN model.
+            config_kwargs["output_optimize"] = False
+            print("[INFO] --keep_float_io: output_optimize=0, outputs will stay float32")
+        ret = rknn.config(**config_kwargs)
         if ret != 0:
             raise RuntimeError(f"RKNN.config failed with ret={ret}")
 

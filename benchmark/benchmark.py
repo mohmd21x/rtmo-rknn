@@ -21,7 +21,7 @@ if str(ROOT / "rtmo") not in sys.path:
 # lazily inside run_benchmark so that aarch64 boards without CUDA/TRT don't crash
 # at import time when --rknn_only is used.
 from rtmo_gpu import coco17  # noqa: E402
-from rtmo_rknn import RTMO_RKNN  # noqa: E402
+from rtmo_rknn import RTMO_RKNN, match_detections_by_iou  # noqa: E402
 
 
 def str2bool(value: str) -> bool:
@@ -97,8 +97,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--score_threshold",
         type=float,
-        default=0.15,
-        help="RKNN detection score threshold (try 0.05 on PC simulator if no detections)",
+        default=0.3,
+        help="Final RKNN score threshold after NMS (default 0.3, matches ONNX; try 0.4-0.5 for INT8)",
+    )
+    parser.add_argument(
+        "--match_iou",
+        type=float,
+        default=0.3,
+        help="Min bbox IoU to pair ONNX/RKNN detections for keypoint comparison",
     )
     parser.add_argument(
         "--rknn_only",
@@ -108,6 +114,15 @@ def parse_args() -> argparse.Namespace:
             "Skip ONNX inference entirely and only benchmark RKNN speed. "
             "Use on the board when onnxruntime crashes (e.g. no CUDA/TRT libs). "
             "Keypoint accuracy columns will be omitted from the report."
+        ),
+    )
+    parser.add_argument(
+        "--count_csv",
+        type=Path,
+        default=None,
+        help=(
+            "Per-frame bbox count CSV (frame, onnx_dets, rknn_dets, delta). "
+            "Default: <output_stem>_det_counts.csv"
         ),
     )
     return parser.parse_args()
@@ -171,6 +186,13 @@ def run_benchmark(args: argparse.Namespace) -> Dict[str, object]:
     rknn_ms_values: List[float] = []
     processed_frames = 0
     valid_frames = 0
+    matched_pairs = 0
+    iou_sum = 0.0
+    onnx_detect_frames = 0
+    rknn_detect_frames = 0
+    onnx_det_counts: List[int] = []
+    rknn_det_counts: List[int] = []
+    count_match_frames = 0
 
     progress_total = total_to_process if total_to_process is not None else 0
     progress = tqdm(total=progress_total, desc="Benchmarking", unit="frame", dynamic_ncols=True)
@@ -198,23 +220,38 @@ def run_benchmark(args: argparse.Namespace) -> Dict[str, object]:
             rknn_ms = (time.perf_counter() - rknn_start) * 1000.0
             rknn_ms_values.append(rknn_ms)
 
+            rknn_people = len(rknn_bboxes)
+            rknn_det_counts.append(rknn_people)
+
+            if len(rknn_bboxes) > 0:
+                rknn_detect_frames += 1
+
             if onnx_model is not None:
                 onnx_people = len(onnx_bboxes)
-                rknn_people = len(rknn_bboxes)
+                onnx_det_counts.append(onnx_people)
+
+                if onnx_people > 0:
+                    onnx_detect_frames += 1
+                if onnx_people == rknn_people:
+                    count_match_frames += 1
 
                 if onnx_people > 0 and rknn_people > 0:
-                    valid_frames += 1
-                    matched_people = min(onnx_people, rknn_people)
-                    onnx_kpts = np.asarray(onnx_keypoints[:matched_people], dtype=np.float64)
-                    rknn_kpts = np.asarray(rknn_keypoints[:matched_people], dtype=np.float64)
-
-                    diffs = onnx_kpts - rknn_kpts
-                    l2 = np.linalg.norm(diffs, axis=2)
-                    mae = np.mean(np.abs(diffs), axis=2)
-
-                    l2_sum += np.sum(l2, axis=0)
-                    mae_sum += np.sum(mae, axis=0)
-                    sample_count += l2.shape[0]
+                    pairs = match_detections_by_iou(
+                        onnx_bboxes, rknn_bboxes, iou_threshold=args.match_iou
+                    )
+                    if pairs:
+                        valid_frames += 1
+                    for onnx_idx, rknn_idx, pair_iou in pairs:
+                        matched_pairs += 1
+                        iou_sum += pair_iou
+                        onnx_kpts = np.asarray(onnx_keypoints[onnx_idx], dtype=np.float64)
+                        rknn_kpts = np.asarray(rknn_keypoints[rknn_idx], dtype=np.float64)
+                        diffs = onnx_kpts - rknn_kpts
+                        l2 = np.linalg.norm(diffs, axis=1)
+                        mae = np.mean(np.abs(diffs), axis=1)
+                        l2_sum += l2
+                        mae_sum += mae
+                        sample_count += 1
 
             processed_frames += 1
             progress.update(1)
@@ -246,8 +283,32 @@ def run_benchmark(args: argparse.Namespace) -> Dict[str, object]:
         "rknn_fps_mean": (1000.0 / rknn_ms_mean) if rknn_ms_mean > 0 else 0.0,
         "processed_frames": processed_frames,
         "valid_frames": valid_frames,
+        "matched_pairs": matched_pairs,
+        "mean_match_iou": (iou_sum / matched_pairs) if matched_pairs > 0 else 0.0,
+        "onnx_detect_frames": onnx_detect_frames,
+        "rknn_detect_frames": rknn_detect_frames,
+        "onnx_det_counts": onnx_det_counts,
+        "rknn_det_counts": rknn_det_counts,
+        "onnx_bbox_total": int(sum(onnx_det_counts)),
+        "rknn_bbox_total": int(sum(rknn_det_counts)),
+        "count_match_frames": count_match_frames,
         "rknn_only": args.rknn_only,
+        "use_simulator": args.use_simulator,
+        "score_threshold": args.score_threshold,
     }
+
+
+def write_det_count_csv(
+    output_path: Path,
+    onnx_counts: List[int],
+    rknn_counts: List[int],
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(["frame", "onnx_dets", "rknn_dets", "delta"])
+        for frame_idx, (onnx_n, rknn_n) in enumerate(zip(onnx_counts, rknn_counts)):
+            writer.writerow([frame_idx, onnx_n, rknn_n, rknn_n - onnx_n])
 
 
 def write_csv(output_path: Path, results: Dict[str, object]) -> None:
@@ -274,6 +335,46 @@ def print_report(results: Dict[str, object], output_path: Path) -> None:
     if not rknn_only:
         print(f"Valid overlap frames: {results['valid_frames']}")
         print(
+            f"Frames with detections: ONNX={results['onnx_detect_frames']}, "
+            f"RKNN={results['rknn_detect_frames']}"
+        )
+        onnx_counts = results.get("onnx_det_counts", [])
+        rknn_counts = results.get("rknn_det_counts", [])
+        if onnx_counts and rknn_counts:
+            n = len(onnx_counts)
+            print(
+                f"Bbox counts/frame: ONNX total={results['onnx_bbox_total']} "
+                f"mean={results['onnx_bbox_total'] / n:.2f} "
+                f"min={min(onnx_counts)} max={max(onnx_counts)}"
+            )
+            print(
+                f"Bbox counts/frame: RKNN total={results['rknn_bbox_total']} "
+                f"mean={results['rknn_bbox_total'] / n:.2f} "
+                f"min={min(rknn_counts)} max={max(rknn_counts)}"
+            )
+            print(
+                f"Frames with matching bbox counts: {results['count_match_frames']} "
+                f"({100.0 * results['count_match_frames'] / n:.1f}%)"
+            )
+        print(
+            f"Matched detection pairs: {results['matched_pairs']} "
+            f"(mean IoU={results['mean_match_iou']:.3f})"
+        )
+        if results["valid_frames"] == 0:
+            if results["rknn_detect_frames"] == 0 and results["use_simulator"]:
+                print(
+                    "[WARN] RKNN simulator returned 0 detections. "
+                    "Try --score_threshold 0.05 on PC simulator."
+                )
+            elif results["onnx_detect_frames"] == 0:
+                print("[WARN] ONNX returned 0 detections on all frames.")
+            elif results["rknn_detect_frames"] == 0:
+                print("[WARN] RKNN returned 0 detections on all frames.")
+            else:
+                print(
+                    "[WARN] ONNX and RKNN both detected people, but never on the same frame."
+                )
+        print(
             f"Mean ONNX inference: {results['onnx_ms_mean']:.2f} ms "
             f"({results['onnx_fps_mean']:.2f} FPS)"
         )
@@ -282,6 +383,15 @@ def print_report(results: Dict[str, object], output_path: Path) -> None:
         f"Mean RKNN inference: {results['rknn_ms_mean']:.2f} ms "
         f"({results['rknn_fps_mean']:.2f} FPS)"
     )
+    if rknn_only:
+        print(f"Frames with RKNN detections: {results['rknn_detect_frames']}")
+        if results["rknn_detect_frames"] == 0:
+            hint = (
+                "Try --score_threshold 0.05 on PC simulator."
+                if results.get("use_simulator")
+                else "Try lowering --score_threshold (e.g. 0.05)."
+            )
+            print(f"[WARN] RKNN returned 0 detections on all frames. {hint}")
 
     if not rknn_only:
         table_rows = []
@@ -310,6 +420,18 @@ def main() -> None:
     args = parse_args()
     results = run_benchmark(args)
     write_csv(args.output, results)
+    if not results.get("rknn_only") and results.get("onnx_det_counts"):
+        count_csv = (
+            args.count_csv
+            if args.count_csv is not None
+            else args.output.with_name(f"{args.output.stem}_det_counts.csv")
+        )
+        write_det_count_csv(
+            count_csv,
+            results["onnx_det_counts"],
+            results["rknn_det_counts"],
+        )
+        print(f"[INFO] Per-frame bbox counts written to: {count_csv}")
     print_report(results, args.output)
 
 
