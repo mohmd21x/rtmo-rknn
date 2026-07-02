@@ -559,6 +559,12 @@ class RTMO_RKNN:
         self.onnx_output_names: Optional[List[str]] = None
         self._rknn_input_layout = "nhwc"
         self._rknn_input_dtype = np.uint8
+        self._rknn_input_pass_through = False
+        self._debug = os.environ.get("RTMO_RKNN_DEBUG", "").lower() in {
+            "1",
+            "true",
+            "yes",
+        }
 
         decoder_path = _resolve_decoder_params(model_path, decoder_params)
         self.decoder = DCCDecoder(str(decoder_path))
@@ -654,15 +660,8 @@ class RTMO_RKNN:
             if ret != 0:
                 raise RuntimeError(f"Failed to load RKNN model: ret={ret}")
 
-            # On-board: init locally. target/device_id are for remote ADB from a PC.
-            try:
-                from rknnlite.api import RKNNLite as _RKNNLite
-
-                ret = self.rknn.init_runtime(
-                    core_mask=_RKNNLite.NPU_CORE_AUTO,
-                )
-            except (AttributeError, TypeError):
-                ret = self.rknn.init_runtime()
+            # Plain init_runtime() is most stable across rknnlite 2.3.x board builds.
+            ret = self.rknn.init_runtime()
             if ret != 0:
                 raise RuntimeError(f"Failed to init RKNN device runtime: ret={ret}")
             self._query_rknn_input_spec()
@@ -672,10 +671,19 @@ class RTMO_RKNN:
         if self.backend == "onnx" or self.rknn is None:
             return
 
-        # RK3588 RTMO models (see fall_cpp PoseEstimatorRKNN) use float NHWC 0-255.
-        if self.backend == "device":
-            self._rknn_input_layout = "nhwc"
+        # RKNN models here are converted with mean=[0,0,0], std=[255,255,255].
+        # rknnlite expects uint8 4D NHWC and applies normalization internally.
+        self._rknn_input_layout = "nhwc"
+        self._rknn_input_dtype = np.uint8
+        self._rknn_input_pass_through = False
+
+        env_mode = os.environ.get("RTMO_RKNN_INPUT", "").strip().lower()
+        if env_mode in {"float", "float32"}:
             self._rknn_input_dtype = np.float32
+            self._rknn_input_pass_through = True
+        elif env_mode == "float16":
+            self._rknn_input_dtype = np.float16
+            self._rknn_input_pass_through = True
 
         try:
             if hasattr(self.rknn, "get_input_detail"):
@@ -691,19 +699,32 @@ class RTMO_RKNN:
                     dtype_name = str(
                         detail.get("dtype", detail.get("type", ""))
                     ).lower()
-                    if "float32" in dtype_name or dtype_name.endswith("float"):
-                        self._rknn_input_dtype = np.float32
-                    elif "float16" in dtype_name:
-                        self._rknn_input_dtype = np.float16
+                    if env_mode:
+                        pass
                     elif "uint8" in dtype_name:
                         self._rknn_input_dtype = np.uint8
+                        self._rknn_input_pass_through = False
+                    elif "float16" in dtype_name:
+                        self._rknn_input_dtype = np.float16
+                        self._rknn_input_pass_through = True
+                    elif "float32" in dtype_name or dtype_name.endswith("float"):
+                        self._rknn_input_dtype = np.float32
+                        self._rknn_input_pass_through = True
         except Exception as exc:
             print(f"[WARN] Could not query RKNN input attributes: {exc}")
 
         print(
             f"[INFO] RKNN input: layout={self._rknn_input_layout}, "
-            f"dtype={self._rknn_input_dtype}"
+            f"dtype={self._rknn_dtype_str()}, "
+            f"pass_through={self._rknn_input_pass_through}"
         )
+
+    def _rknn_dtype_str(self) -> str:
+        if self._rknn_input_dtype == np.float32:
+            return "float32"
+        if self._rknn_input_dtype == np.float16:
+            return "float16"
+        return "uint8"
 
     def _prepare_rknn_input(self, img: np.ndarray) -> np.ndarray:
         """Build 4D rknnlite input (batch, H, W, C) or NCHW when required."""
@@ -761,23 +782,49 @@ class RTMO_RKNN:
             return outputs
 
         inp = self._prepare_rknn_input(img)
-        layout = self._rknn_input_layout
-        try:
-            outputs = self.rknn.inference(
-                inputs=[inp], data_format=[layout]
+        if self._debug:
+            print(
+                f"[DEBUG] rknn inference input shape={inp.shape}, "
+                f"dtype={inp.dtype}, layout={self._rknn_input_layout}"
             )
-        except TypeError:
+
+        dtype_name = self._rknn_dtype_str()
+        pass_through = [1 if self._rknn_input_pass_through else 0]
+        call_variants = [
+            dict(
+                inputs=[inp],
+                data_type=dtype_name,
+                data_format=self._rknn_input_layout,
+                inputs_pass_through=pass_through,
+            ),
+            dict(
+                inputs=[inp],
+                data_type=dtype_name,
+                data_format=self._rknn_input_layout,
+            ),
+            dict(inputs=[inp], data_type=dtype_name),
+            dict(inputs=[inp]),
+        ]
+
+        outputs = None
+        last_exc: Optional[Exception] = None
+        for kwargs in call_variants:
             try:
-                outputs = self.rknn.inference(
-                    inputs=[inp], data_format=layout
-                )
-            except TypeError:
-                outputs = self.rknn.inference(inputs=[inp])
+                outputs = self.rknn.inference(**kwargs)
+                break
+            except (TypeError, ValueError) as exc:
+                last_exc = exc
+                continue
+
+        if outputs is None and last_exc is not None:
+            raise RuntimeError(f"RKNN inference failed: {last_exc}") from last_exc
         if outputs is None:
             raise RuntimeError(
                 "RKNN inference returned None. Check input layout/dtype "
-                f"(expected 4D {layout}, dtype={self._rknn_input_dtype})."
+                f"(expected 4D {self._rknn_input_layout}, dtype={dtype_name})."
             )
+        if self._debug:
+            print(f"[DEBUG] rknn inference outputs={len(outputs)} tensors")
         return outputs
 
     def _parse_no_nms_outputs(
@@ -877,8 +924,17 @@ class RTMO_RKNN:
         self, image: np.ndarray
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         img_out = image.copy()
+        if self._debug:
+            print("[DEBUG] preprocess")
         preprocessed, ratio = self.preprocess(image)
+        if self._debug:
+            print(
+                f"[DEBUG] preprocessed shape={preprocessed.shape}, "
+                f"dtype={preprocessed.dtype}"
+            )
         outputs = self.inference(preprocessed)
+        if self._debug:
+            print("[DEBUG] postprocess")
         bboxes, bbox_scores, keypoints, kpt_scores = self.postprocess(outputs, ratio)
         return img_out, bboxes, bbox_scores, keypoints, kpt_scores
 

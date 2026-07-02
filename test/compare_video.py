@@ -148,6 +148,46 @@ def _rknn_display_label(backend: str) -> str:
     return f"RKNN ({backend})"
 
 
+def _draw_simple_bbox(panel, bboxes, bbox_scores) -> Any:
+    for i, bbox in enumerate(bboxes):
+        x1, y1, x2, y2 = (int(v) for v in bbox[:4])
+        cv2.rectangle(panel, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        if bbox_scores is not None and len(bbox_scores) > i:
+            cv2.putText(
+                panel,
+                f"{float(bbox_scores[i]):.2f}",
+                (x1, max(0, y1 - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 255, 0),
+                1,
+                cv2.LINE_AA,
+            )
+    return panel
+
+
+def _draw_simple_skeleton(panel, keypoints, kpt_scores, kpt_thr: float) -> Any:
+    if len(keypoints) == 0:
+        return panel
+    kpts = keypoints.reshape(-1, keypoints.shape[-2], keypoints.shape[-1])
+    scores = kpt_scores.reshape(-1, kpt_scores.shape[-1])
+    edges = (
+        (0, 1), (0, 2), (1, 3), (2, 4), (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
+        (5, 11), (6, 12), (11, 12), (11, 13), (13, 15), (12, 14), (14, 16),
+    )
+    for person_kpts, person_scores in zip(kpts, scores):
+        for x, y in person_kpts:
+            if x > 0 or y > 0:
+                cv2.circle(panel, (int(x), int(y)), 2, (0, 255, 255), -1)
+        for a, b in edges:
+            if person_scores[a] < kpt_thr or person_scores[b] < kpt_thr:
+                continue
+            pa = (int(person_kpts[a][0]), int(person_kpts[a][1]))
+            pb = (int(person_kpts[b][0]), int(person_kpts[b][1]))
+            cv2.line(panel, pa, pb, (255, 128, 0), 2)
+    return panel
+
+
 def annotate_panel(
     frame: Any,
     bboxes,
@@ -159,14 +199,21 @@ def annotate_panel(
     kpt_thr: float = 0.1,
     draw_bbox_fn=None,
     draw_skeleton_fn=None,
+    simple_draw: bool = False,
 ) -> Any:
-    if draw_bbox_fn is None or draw_skeleton_fn is None:
-        _, draw_bbox_fn, draw_skeleton_fn = _import_rtmo_gpu()
     panel = frame.copy()
-    if len(keypoints) > 0:
-        panel = draw_skeleton_fn(panel, keypoints, kpt_scores, kpt_thr=kpt_thr)
-    if len(bboxes) > 0:
-        panel = draw_bbox_fn(panel, bboxes, bbox_scores)
+    if simple_draw:
+        if len(keypoints) > 0:
+            panel = _draw_simple_skeleton(panel, keypoints, kpt_scores, kpt_thr)
+        if len(bboxes) > 0:
+            panel = _draw_simple_bbox(panel, bboxes, bbox_scores)
+    else:
+        if draw_bbox_fn is None or draw_skeleton_fn is None:
+            _, draw_bbox_fn, draw_skeleton_fn = _import_rtmo_gpu()
+        if len(keypoints) > 0:
+            panel = draw_skeleton_fn(panel, keypoints, kpt_scores, kpt_thr=kpt_thr)
+        if len(bboxes) > 0:
+            panel = draw_bbox_fn(panel, bboxes, bbox_scores)
     fps = 1000.0 / inference_ms if inference_ms > 0 else 0.0
     line1 = f"{label} | {inference_ms:.1f} ms | {fps:.1f} FPS | dets: {len(bboxes)}"
     cv2.putText(
@@ -205,7 +252,11 @@ def infer_onnx(
 
 
 def infer_rknn(
-    model: RTMO_RKNN, frame, kpt_thr: float, panel_label: str = "RKNN"
+    model: RTMO_RKNN,
+    frame,
+    kpt_thr: float,
+    panel_label: str = "RKNN",
+    simple_draw: bool = False,
 ) -> Tuple[Any, float, float, int]:
     start = time.perf_counter()
     _, bboxes, bbox_scores, keypoints, kpt_scores = model(frame)
@@ -219,6 +270,7 @@ def infer_rknn(
         panel_label,
         inference_ms,
         kpt_thr,
+        simple_draw=simple_draw,
     )
     fps = 1000.0 / inference_ms if inference_ms > 0 else 0.0
     return panel, inference_ms, fps, len(bboxes)
@@ -428,7 +480,11 @@ def main() -> None:
 
             if rknn_only:
                 rknn_panel, rknn_ms, rknn_fps, rknn_n = infer_rknn(
-                    rknn_model, frame, args.kpt_thr, panel_label=rknn_label
+                    rknn_model,
+                    frame,
+                    args.kpt_thr,
+                    panel_label=rknn_label,
+                    simple_draw=True,
                 )
                 rknn_det_counts.append(rknn_n)
                 rknn_ms_values.append(rknn_ms)
