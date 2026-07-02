@@ -1,0 +1,12 @@
+# RK3588 on-device runtime (inference only — no rknn-toolkit2)
+numpy
+opencv-python
+tqdm
+tabulate
+
+# Optional: only if you run ONNX side-by-side compare/benchmark on the board
+# onnxruntime
+
+# Install rknnlite2 from Rockchip's wheel for your board Python version, e.g.:
+#   pip install rknnlite2-*.whl
+# Do NOT install rknn-toolkit2 on device unless you plan to convert there.

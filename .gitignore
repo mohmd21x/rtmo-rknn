@@ -1,0 +1,73 @@
+# ── Default: ignore everything, then whitelist essentials ──────────────────
+*
+
+!.gitignore
+!README.md
+!RK3588.md
+!requirements.txt
+!requirements-rk3588.txt
+!rtmo_rknn.py
+
+# benchmark (script only; not CSV results)
+!benchmark/
+!benchmark/benchmark.py
+
+# convert (scripts + decoder weights; not generated artifacts)
+!convert/
+!convert/*.py
+!convert/*.sh
+!convert/decoder/
+!convert/decoder/*.yml
+
+# test (script only; not output videos)
+!test/
+!test/compare_video.py
+
+# INT8 calibration images
+!sample-data/
+!sample-data/**
+
+# RTMO essentials: GPU reference wrapper, source ONNX (s/m), demo video
+!rtmo/
+!rtmo/rtmo_gpu.py
+!rtmo/rtmo-s.onnx
+!rtmo/rtmo-m.onnx
+!rtmo/video/
+!rtmo/video/**
+
+# ── Re-ignore generated / cache / artifacts inside allowed trees ───────────
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+.venv/
+venv/
+.env
+.env.*
+
+# RKNN / ONNX build outputs (regenerate with convert/)
+convert/no_nms_onnx/
+convert/models/
+convert/**/*.tmp
+
+# Root-level RKNN toolkit temp checkpoints
+/check*.onnx
+
+# Benchmark / test outputs
+benchmark/*.csv
+test/*.mp4
+test/*.avi
+test/*.mkv
+
+# Reference sample tree (duplicate of convert/decoder + models)
+rtmo_s-SAMPLE/
+
+# Editor / OS noise
+.cursor/
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db

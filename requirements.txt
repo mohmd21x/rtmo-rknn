@@ -1,0 +1,6 @@
+onnxruntime
+rknn-toolkit2>=2.0.0
+numpy
+opencv-python
+tqdm
+tabulate

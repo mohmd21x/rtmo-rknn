@@ -1,0 +1,690 @@
+import os
+import re
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import cv2
+import numpy as np
+
+NUM_KEYPOINTS = 17
+_SCALAR_RE = re.compile(r"^([A-Za-z0-9_]+):\s*(.+?)\s*$")
+_MATRIX_HEADER_RE = re.compile(r"^([A-Za-z0-9_]+):\s*!!opencv-matrix\s*$")
+
+
+def _silu(x: np.ndarray) -> np.ndarray:
+    return x / (1.0 + np.exp(-x))
+
+
+def _softmax_stable(v: np.ndarray) -> np.ndarray:
+    if v.size == 0:
+        return v
+    out = v.astype(np.float32, copy=True)
+    out -= out.max()
+    np.exp(out, out=out)
+    s = out.sum()
+    if s > 1e-12:
+        out /= s
+    return out
+
+
+def _linear_forward(
+    x: np.ndarray,
+    weight: np.ndarray,
+    bias: Optional[np.ndarray],
+    out_dim: int,
+) -> np.ndarray:
+    """Row-major weight layout: weight shape (out_dim, in_dim)."""
+    out = np.zeros(out_dim, dtype=np.float32)
+    in_dim = x.shape[0]
+    for o in range(out_dim):
+        v = 0.0 if bias is None or bias.size == 0 else float(bias[o])
+        out[o] = v + float(np.dot(weight[o * in_dim : (o + 1) * in_dim], x))
+    return out
+
+
+def _parse_scalar(value: str):
+    value = value.strip()
+    if value.startswith('"') and value.endswith('"'):
+        return value[1:-1]
+    if value.startswith("'") and value.endswith("'"):
+        return value[1:-1]
+    try:
+        if any(ch in value for ch in (".", "e", "E")):
+            return float(value)
+        return int(value)
+    except ValueError:
+        return value
+
+
+def _parse_opencv_matrix_block(lines: List[str], start_idx: int) -> Tuple[np.ndarray, int]:
+    rows = cols = 0
+    data_tokens: List[str] = []
+    idx = start_idx
+    while idx < len(lines):
+        raw = lines[idx]
+        line = raw.strip()
+        if not line:
+            idx += 1
+            continue
+        if not raw[:1].isspace():
+            break
+        if line.startswith("rows:"):
+            rows = int(line.split(":", 1)[1].strip())
+        elif line.startswith("cols:"):
+            cols = int(line.split(":", 1)[1].strip())
+        elif line.startswith("data:"):
+            data_part = line.split(":", 1)[1].strip()
+            if data_part.startswith("["):
+                data_tokens.append(data_part)
+                while not data_tokens[-1].endswith("]") and idx + 1 < len(lines):
+                    idx += 1
+                    next_raw = lines[idx]
+                    if not next_raw[:1].isspace():
+                        break
+                    data_tokens.append(next_raw.strip())
+        idx += 1
+
+    if not data_tokens:
+        return np.array([], dtype=np.float32), idx
+
+    raw = " ".join(data_tokens)
+    raw = raw[raw.find("[") + 1 : raw.rfind("]")]
+    if not raw.strip():
+        return np.array([], dtype=np.float32), idx
+
+    values = np.fromstring(raw.replace(",", " "), sep=" ", dtype=np.float32)
+    if rows > 0 and cols > 0 and values.size == rows * cols:
+        return values.reshape(rows, cols), idx
+    return values, idx
+
+
+def _load_decoder_yaml(path: Path) -> Dict[str, object]:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    params: Dict[str, object] = {}
+    idx = 0
+    while idx < len(lines):
+        line = lines[idx].strip()
+        idx += 1
+        if not line or line.startswith("%") or line == "---":
+            continue
+
+        matrix_match = _MATRIX_HEADER_RE.match(line)
+        if matrix_match:
+            key = matrix_match.group(1)
+            arr, idx = _parse_opencv_matrix_block(lines, idx)
+            params[key] = arr
+            continue
+
+        scalar_match = _SCALAR_RE.match(line)
+        if scalar_match:
+            key, value = scalar_match.groups()
+            if value == "!!opencv-matrix":
+                arr, idx = _parse_opencv_matrix_block(lines, idx)
+                params[key] = arr
+            else:
+                params[key] = _parse_scalar(value)
+    return params
+
+
+def _resolve_decoder_params(model_path: str, decoder_params: Optional[str]) -> Path:
+    if decoder_params:
+        return Path(decoder_params)
+    path_lower = model_path.lower()
+    repo_root = Path(__file__).resolve().parent
+    if "rtmo-m" in path_lower or "rtmo_m" in path_lower:
+        return repo_root / "convert" / "decoder" / "rtmo_m_dcc_decoder_params.yml"
+    return repo_root / "convert" / "decoder" / "rtmo_s_dcc_decoder_params.yml"
+
+
+def _resolve_no_nms_onnx(rknn_path: str, rknn_onnx: Optional[str]) -> Path:
+    if rknn_onnx:
+        return Path(rknn_onnx)
+    rknn = Path(rknn_path)
+    stem = rknn.stem
+    for suffix in (".fp16", ".int8"):
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+    return rknn.resolve().parents[1] / "no_nms_onnx" / f"{stem}-no-nms.onnx"
+
+
+def _detect_rknn_quant(rknn_path: str) -> str:
+    lower = rknn_path.lower()
+    if ".int8." in lower or lower.endswith(".int8.rknn"):
+        return "int8"
+    return "fp16"
+
+
+def _collect_calibration_images(sample_data_dir: Path, limit: int = 4) -> List[Path]:
+    if not sample_data_dir.exists():
+        raise FileNotFoundError(f"Sample data directory not found: {sample_data_dir}")
+    image_files = sorted(
+        p
+        for p in sample_data_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png"}
+    )
+    if len(image_files) < limit:
+        raise ValueError(
+            f"INT8 simulator build needs at least {limit} calibration images, "
+            f"found {len(image_files)} in {sample_data_dir}"
+        )
+    return image_files[:limit]
+
+
+class DCCDecoder:
+    """CPU GAU decoder for RTMO no-NMS RKNN outputs."""
+
+    def __init__(self, yaml_path: str):
+        path = Path(yaml_path)
+        if not path.exists():
+            raise FileNotFoundError(f"DCC decoder params not found: {yaml_path}")
+
+        params = _load_decoder_yaml(path)
+
+        num_keypoints = int(params["num_keypoints"])
+        if num_keypoints != NUM_KEYPOINTS:
+            raise ValueError(
+                f"Expected {NUM_KEYPOINTS} keypoints in decoder params, got {num_keypoints}"
+            )
+
+        self.in_channels = int(params["in_channels"])
+        self.feat_channels = int(params["feat_channels"])
+        self.num_bins_x = int(params["num_bins_x"])
+        self.num_bins_y = int(params["num_bins_y"])
+        self.gau_s = int(params["gau_s"])
+        self.gau_e = int(params["gau_e"])
+        self.gau_sqrt_s = float(params["gau_sqrt_s"])
+        self.gau_ln_scale = float(params["gau_ln_scale"])
+        self.gau_ln_eps = float(params["gau_ln_eps"])
+        self.bbox_padding = float(params["bbox_padding"])
+        self.gau_pos_enc_mode = str(params["gau_pos_enc_mode"])
+
+        def _flat(key: str) -> np.ndarray:
+            return np.asarray(params[key], dtype=np.float32).reshape(-1)
+
+        self.x_bins = _flat("x_bins")
+        self.y_bins = _flat("y_bins")
+        self.spe_dim_t = _flat("spe_dim_t")
+        self.gau_pos_enc = _flat("gau_pos_enc")
+        self.pose_to_kpts_weight = _flat("pose_to_kpts_weight")
+        self.pose_to_kpts_bias = _flat("pose_to_kpts_bias")
+        self.x_fc_weight = _flat("x_fc_weight")
+        self.x_fc_bias = _flat("x_fc_bias")
+        self.y_fc_weight = _flat("y_fc_weight")
+        self.y_fc_bias = _flat("y_fc_bias")
+        self.gau_uv_weight = _flat("gau_uv_weight")
+        self.gau_uv_bias = _flat("gau_uv_bias")
+        self.gau_o_weight = _flat("gau_o_weight")
+        self.gau_o_bias = _flat("gau_o_bias")
+        self.gau_gamma = _flat("gau_gamma")
+        self.gau_beta = _flat("gau_beta")
+        self.gau_ln_g = _flat("gau_ln_g")
+        self.gau_res_scale = _flat("gau_res_scale")
+        self.flatten_priors_640 = _flat("flatten_priors_640")
+
+        if (
+            self.in_channels <= 0
+            or self.feat_channels <= 0
+            or self.num_bins_x <= 0
+            or self.num_bins_y <= 0
+            or self.gau_s <= 0
+            or self.gau_e <= 0
+        ):
+            raise ValueError(f"Invalid decoder params in {yaml_path}")
+
+    def decode(
+        self,
+        pose_vec: np.ndarray,
+        prior_xy: np.ndarray,
+        bbox_xyxy: np.ndarray,
+    ) -> np.ndarray:
+        """Decode one detection to keypoint xy coordinates in 640-space."""
+        k = NUM_KEYPOINTS
+        c = self.feat_channels
+        d = self.in_channels
+        bx = self.num_bins_x
+        by = self.num_bins_y
+        s = self.gau_s
+        e = self.gau_e
+        spe = self.spe_dim_t.size * 2
+
+        x1, y1, x2, y2 = bbox_xyxy
+        cx = (x1 + x2) * 0.5
+        cy = (y1 + y2) * 0.5
+        sx = max(1e-4, (x2 - x1) * self.bbox_padding)
+        sy = max(1e-4, (y2 - y1) * self.bbox_padding)
+        gx, gy = prior_xy
+        center_x = cx - gx
+        center_y = cy - gy
+
+        kpt_feats_flat = _linear_forward(
+            pose_vec.astype(np.float32),
+            self.pose_to_kpts_weight,
+            self.pose_to_kpts_bias,
+            k * c,
+        )
+        kpt_feats = np.zeros(k * c, dtype=np.float32)
+        uv_tokens = np.zeros(k * (2 * e + s), dtype=np.float32)
+
+        for t in range(k):
+            inp = kpt_feats_flat[t * c : (t + 1) * c]
+            norm = max(1e-12, float(np.dot(inp, inp)))
+            norm = max(np.sqrt(norm) * self.gau_ln_scale, self.gau_ln_eps)
+            ln_g = 1.0 if self.gau_ln_g.size == 0 else float(self.gau_ln_g[0])
+            x_norm = (inp / norm) * ln_g
+            uv = _linear_forward(
+                x_norm,
+                self.gau_uv_weight,
+                self.gau_uv_bias if self.gau_uv_bias.size else None,
+                2 * e + s,
+            )
+            uv = _silu(uv)
+            kpt_feats[t * c : (t + 1) * c] = x_norm
+            uv_tokens[t * (2 * e + s) : (t + 1) * (2 * e + s)] = uv
+
+        u = np.zeros(k * e, dtype=np.float32)
+        v = np.zeros(k * e, dtype=np.float32)
+        q = np.zeros(k * s, dtype=np.float32)
+        key = np.zeros(k * s, dtype=np.float32)
+        for t in range(k):
+            uv = uv_tokens[t * (2 * e + s) : (t + 1) * (2 * e + s)]
+            for i in range(e):
+                u[t * e + i] = uv[i]
+                v[t * e + i] = uv[e + i]
+            for i in range(s):
+                base = uv[2 * e + i]
+                q[t * s + i] = base * self.gau_gamma[i] + self.gau_beta[i]
+                key[t * s + i] = (
+                    base * self.gau_gamma[s + i] + self.gau_beta[s + i]
+                )
+                if (
+                    self.gau_pos_enc_mode == "add"
+                    and self.gau_pos_enc.size == k * s
+                ):
+                    q[t * s + i] += self.gau_pos_enc[t * s + i]
+                    key[t * s + i] += self.gau_pos_enc[t * s + i]
+
+        kernel = np.zeros(k * k, dtype=np.float32)
+        for i in range(k):
+            for j in range(k):
+                dot = float(np.dot(q[i * s : (i + 1) * s], key[j * s : (j + 1) * s]))
+                z = max(0.0, dot / self.gau_sqrt_s)
+                kernel[i * k + j] = z * z
+
+        kv = np.zeros(k * e, dtype=np.float32)
+        for i in range(k):
+            for e_idx in range(e):
+                kv[i * e + e_idx] = float(
+                    np.dot(
+                        kernel[i * k : (i + 1) * k],
+                        v[: k * e].reshape(k, e)[:, e_idx],
+                    )
+                )
+
+        gau_out = np.zeros(k * c, dtype=np.float32)
+        for i in range(k):
+            pre_o = u[i * e : (i + 1) * e] * kv[i * e : (i + 1) * e]
+            o_vec = _linear_forward(
+                pre_o,
+                self.gau_o_weight,
+                self.gau_o_bias if self.gau_o_bias.size else None,
+                c,
+            )
+            for c_idx in range(c):
+                res_scale = (
+                    1.0
+                    if self.gau_res_scale.size == 0
+                    else float(self.gau_res_scale[c_idx])
+                )
+                gau_out[i * c + c_idx] = (
+                    res_scale * kpt_feats[i * c + c_idx] + o_vec[c_idx]
+                )
+
+        x_bins = self.x_bins[:bx] * sx + center_x
+        y_bins = self.y_bins[:by] * sy + center_y
+
+        x_bins_enc = np.zeros(bx * c, dtype=np.float32)
+        y_bins_enc = np.zeros(by * c, dtype=np.float32)
+        for b in range(bx):
+            spe_vec = np.zeros(spe, dtype=np.float32)
+            for t_idx, dim_t in enumerate(self.spe_dim_t):
+                f = x_bins[b] / dim_t
+                spe_vec[t_idx] = np.cos(f)
+                spe_vec[t_idx + self.spe_dim_t.size] = np.sin(f)
+            enc = _linear_forward(
+                spe_vec,
+                self.x_fc_weight,
+                self.x_fc_bias,
+                c,
+            )
+            x_bins_enc[b * c : (b + 1) * c] = enc
+        for b in range(by):
+            spe_vec = np.zeros(spe, dtype=np.float32)
+            for t_idx, dim_t in enumerate(self.spe_dim_t):
+                f = y_bins[b] / dim_t
+                spe_vec[t_idx] = np.cos(f)
+                spe_vec[t_idx + self.spe_dim_t.size] = np.sin(f)
+            enc = _linear_forward(
+                spe_vec,
+                self.y_fc_weight,
+                self.y_fc_bias,
+                c,
+            )
+            y_bins_enc[b * c : (b + 1) * c] = enc
+
+        out_kpts = np.zeros((k, 2), dtype=np.float32)
+        for kpt_idx in range(k):
+            feat = gau_out[kpt_idx * c : (kpt_idx + 1) * c]
+            hx = np.zeros(bx, dtype=np.float32)
+            hy = np.zeros(by, dtype=np.float32)
+            for b in range(bx):
+                hx[b] = float(np.dot(feat, x_bins_enc[b * c : (b + 1) * c]))
+            for b in range(by):
+                hy[b] = float(np.dot(feat, y_bins_enc[b * c : (b + 1) * c]))
+            hx = _softmax_stable(hx)
+            hy = _softmax_stable(hy)
+            x = gx + float(np.dot(hx, x_bins))
+            y = gy + float(np.dot(hy, y_bins))
+            out_kpts[kpt_idx, 0] = x
+            out_kpts[kpt_idx, 1] = y
+        return out_kpts
+
+
+def _iou_xyxy(a: np.ndarray, b: np.ndarray) -> float:
+    xx1 = max(a[0], b[0])
+    yy1 = max(a[1], b[1])
+    xx2 = min(a[2], b[2])
+    yy2 = min(a[3], b[3])
+    w = max(0.0, xx2 - xx1)
+    h = max(0.0, yy2 - yy1)
+    inter = w * h
+    area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+    area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+    union = area_a + area_b - inter
+    if union <= 0.0:
+        return 0.0
+    return inter / union
+
+
+def _nms_xyxy_numpy(
+    boxes: np.ndarray,
+    scores: np.ndarray,
+    iou_threshold: float,
+    max_detections: int,
+) -> List[int]:
+    order = scores.argsort()[::-1]
+    keep: List[int] = []
+    for idx in order:
+        if len(keep) >= max_detections:
+            break
+        suppress = False
+        for kept_idx in keep:
+            if _iou_xyxy(boxes[idx], boxes[kept_idx]) > iou_threshold:
+                suppress = True
+                break
+        if not suppress:
+            keep.append(int(idx))
+    return keep
+
+
+def _nms_xyxy(
+    boxes: np.ndarray,
+    scores: np.ndarray,
+    score_threshold: float,
+    iou_threshold: float,
+    max_detections: int,
+) -> List[int]:
+    if boxes.size == 0:
+        return []
+
+    keep_mask = scores >= score_threshold
+    if not np.any(keep_mask):
+        return []
+
+    boxes = boxes[keep_mask]
+    scores = scores[keep_mask]
+    orig_indices = np.nonzero(keep_mask)[0]
+
+    boxes_xywh = boxes.copy()
+    boxes_xywh[:, 2] = boxes[:, 2] - boxes[:, 0]
+    boxes_xywh[:, 3] = boxes[:, 3] - boxes[:, 1]
+
+    selected: List[int]
+    if hasattr(cv2, "dnn") and hasattr(cv2.dnn, "NMSBoxes"):
+        indices = cv2.dnn.NMSBoxes(
+            boxes_xywh.tolist(),
+            scores.tolist(),
+            score_threshold,
+            iou_threshold,
+            top_k=max_detections,
+        )
+        if len(indices) == 0:
+            return []
+        if isinstance(indices, np.ndarray):
+            flat = indices.reshape(-1)
+        else:
+            flat = np.array(indices).reshape(-1)
+        selected = [int(i) for i in flat]
+    else:
+        selected = _nms_xyxy_numpy(boxes, scores, iou_threshold, max_detections)
+
+    return [int(orig_indices[i]) for i in selected]
+
+
+class RTMO_RKNN:
+    def __init__(
+        self,
+        model_path: str,
+        target: str = "rk3588",
+        device_id: int = 0,
+        use_simulator: bool = True,
+        score_threshold: float = 0.15,
+        nms_iou: float = 0.65,
+        nms_max: int = 200,
+        model_input_size: Tuple[int, int] = (640, 640),
+        decoder_params: Optional[str] = None,
+        rknn_onnx: Optional[str] = None,
+        sample_data: Optional[str] = None,
+    ):
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"RKNN model not found: {model_path}")
+
+        self.model_path = model_path
+        self.target = target
+        self.device_id = str(device_id)
+        self.use_simulator = use_simulator
+        self.score_threshold = score_threshold
+        self.nms_iou = nms_iou
+        self.nms_max = nms_max
+        self.model_input_size = model_input_size
+        self.rknn_onnx = rknn_onnx
+        repo_root = Path(__file__).resolve().parent
+        self.sample_data = (
+            Path(sample_data) if sample_data else repo_root / "sample-data"
+        )
+        self.rknn = None
+
+        decoder_path = _resolve_decoder_params(model_path, decoder_params)
+        self.decoder = DCCDecoder(str(decoder_path))
+
+        self._init_runtime()
+
+    def _init_simulator_from_onnx(self, rknn) -> None:
+        onnx_path = _resolve_no_nms_onnx(self.model_path, self.rknn_onnx)
+        if not onnx_path.exists():
+            raise FileNotFoundError(
+                "rknn-toolkit2 cannot run pre-built .rknn files on the PC simulator "
+                "(load_rknn + init_runtime). Rebuild from a no-NMS ONNX instead.\n"
+                f"Expected ONNX path: {onnx_path}\n"
+                "Run: python convert/export_no_nms.py --model rtmo/rtmo-<s|m>.onnx\n"
+                "Or connect an RK3588 and use --use_simulator false."
+            )
+
+        input_h, input_w = self.model_input_size
+        quant = _detect_rknn_quant(self.model_path)
+        ret = rknn.config(
+            mean_values=[[0, 0, 0]],
+            std_values=[[255, 255, 255]],
+            target_platform=self.target,
+        )
+        if ret != 0:
+            raise RuntimeError(f"RKNN.config failed with ret={ret}")
+
+        ret = rknn.load_onnx(
+            model=str(onnx_path),
+            inputs=["input"],
+            input_size_list=[[1, 3, input_h, input_w]],
+        )
+        if ret != 0:
+            raise RuntimeError(f"RKNN.load_onnx failed with ret={ret}")
+
+        if quant == "int8":
+            dataset_path = Path(self.model_path).parent / "dataset.txt"
+            image_paths = _collect_calibration_images(self.sample_data, limit=4)
+            dataset_path.write_text(
+                "\n".join(str(p.resolve()) for p in image_paths) + "\n",
+                encoding="utf-8",
+            )
+            ret = rknn.build(do_quantization=True, dataset=str(dataset_path))
+        else:
+            ret = rknn.build(do_quantization=False)
+        if ret != 0:
+            raise RuntimeError(f"RKNN.build failed with ret={ret}")
+
+        ret = rknn.init_runtime(target=None)
+        if ret != 0:
+            raise RuntimeError(f"Failed to init RKNN simulator runtime: ret={ret}")
+
+    def _init_runtime(self) -> None:
+        if self.use_simulator:
+            try:
+                from rknn.api import RKNN
+            except ImportError as exc:
+                raise ImportError(
+                    "rknn-toolkit2 is required for simulator mode. Install rknn-toolkit2."
+                ) from exc
+
+            self.rknn = RKNN(verbose=False)
+            self._init_simulator_from_onnx(self.rknn)
+        else:
+            try:
+                from rknnlite.api import RKNNLite
+            except ImportError as exc:
+                raise ImportError(
+                    "rknnlite2 is required for on-device mode. Install rknnlite2 on RK3588."
+                ) from exc
+
+            self.rknn = RKNNLite(verbose=False)
+            ret = self.rknn.load_rknn(self.model_path)
+            if ret != 0:
+                raise RuntimeError(f"Failed to load RKNN model: ret={ret}")
+
+            ret = self.rknn.init_runtime(target=self.target, device_id=self.device_id)
+            if ret != 0:
+                raise RuntimeError(f"Failed to init RKNN device runtime: ret={ret}")
+
+    def preprocess(self, img: np.ndarray) -> Tuple[np.ndarray, float]:
+        if len(img.shape) == 3:
+            padded_img = np.ones(
+                (self.model_input_size[0], self.model_input_size[1], 3), dtype=np.uint8
+            ) * 114
+        else:
+            padded_img = np.ones(self.model_input_size, dtype=np.uint8) * 114
+
+        ratio = min(
+            self.model_input_size[0] / img.shape[0],
+            self.model_input_size[1] / img.shape[1],
+        )
+        resized_img = cv2.resize(
+            img,
+            (int(img.shape[1] * ratio), int(img.shape[0] * ratio)),
+            interpolation=cv2.INTER_LINEAR,
+        ).astype(np.uint8)
+        padded_shape = (int(img.shape[0] * ratio), int(img.shape[1] * ratio))
+        padded_img[: padded_shape[0], : padded_shape[1]] = resized_img
+
+        return padded_img, ratio
+
+    def inference(self, img: np.ndarray) -> List[np.ndarray]:
+        if img.ndim == 3:
+            img = np.expand_dims(img, axis=0)
+        try:
+            outputs = self.rknn.inference(inputs=[img], data_format=["nhwc"])
+        except TypeError:
+            outputs = self.rknn.inference(inputs=[img])
+        return outputs
+
+    def _parse_no_nms_outputs(
+        self, outputs: List[np.ndarray]
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        if len(outputs) != 5:
+            raise ValueError(
+                f"Expected 5 RKNN outputs (bboxes, scores, pose_vecs, kpt_vis, priors), "
+                f"got {len(outputs)}. Convert a no-NMS ONNX model first "
+                f"(python convert/export_no_nms.py)."
+            )
+
+        bboxes = np.asarray(outputs[0], dtype=np.float32).reshape(-1, 4)
+        scores = np.asarray(outputs[1], dtype=np.float32).reshape(-1)
+        pose_vecs = np.asarray(outputs[2], dtype=np.float32).reshape(
+            bboxes.shape[0], -1
+        )
+        kpt_vis = np.asarray(outputs[3], dtype=np.float32).reshape(
+            bboxes.shape[0], NUM_KEYPOINTS
+        )
+        priors = np.asarray(outputs[4], dtype=np.float32).reshape(bboxes.shape[0], 2)
+        return bboxes, scores, pose_vecs, kpt_vis, priors
+
+    def postprocess(
+        self, outputs: List[np.ndarray], ratio: float = 1.0
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        bboxes, scores, pose_vecs, kpt_vis, priors = self._parse_no_nms_outputs(outputs)
+
+        if pose_vecs.shape[1] != self.decoder.in_channels:
+            raise ValueError(
+                f"pose_vecs dim {pose_vecs.shape[1]} does not match decoder "
+                f"in_channels {self.decoder.in_channels}"
+            )
+
+        kept = _nms_xyxy(
+            bboxes,
+            scores,
+            self.score_threshold,
+            self.nms_iou,
+            self.nms_max,
+        )
+        if not kept:
+            return (
+                np.zeros((0, 4), dtype=np.float32),
+                np.zeros((0,), dtype=np.float32),
+                np.zeros((0, NUM_KEYPOINTS, 2), dtype=np.float32),
+                np.zeros((0, NUM_KEYPOINTS), dtype=np.float32),
+            )
+
+        final_boxes = bboxes[kept] / ratio
+        final_scores = scores[kept]
+        final_kpt_vis = kpt_vis[kept]
+
+        keypoints = []
+        for idx in kept:
+            prior = priors[idx]
+            if prior.size == 0:
+                prior = self.decoder.flatten_priors_640.reshape(-1, 2)[idx]
+            kpts_640 = self.decoder.decode(pose_vecs[idx], prior, bboxes[idx])
+            keypoints.append(kpts_640 / ratio)
+
+        keypoints = np.stack(keypoints, axis=0)
+        return final_boxes, final_scores, keypoints, final_kpt_vis
+
+    def __call__(
+        self, image: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        img_out = image.copy()
+        preprocessed, ratio = self.preprocess(image)
+        outputs = self.inference(preprocessed)
+        bboxes, bbox_scores, keypoints, kpt_scores = self.postprocess(outputs, ratio)
+        return img_out, bboxes, bbox_scores, keypoints, kpt_scores
+
+    def release(self) -> None:
+        if self.rknn is not None:
+            self.rknn.release()
