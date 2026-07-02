@@ -6,7 +6,12 @@ import cv2
 from queue import Queue
 
 PLUGIN_LIB_PATHS='libmmdeploy_tensorrt_ops.so'
-os.environ['ORT_TENSORRT_EXTRA_PLUGIN_LIB_PATHS']=PLUGIN_LIB_PATHS
+# Only set the TensorRT plugin env-var on x86_64 where CUDA/TRT is available.
+# On aarch64 (RK3588) the .so does not exist and onnxruntime will segfault at
+# import time if this variable points to a missing library.
+import platform as _platform
+if _platform.machine() in ('x86_64', 'AMD64'):
+    os.environ['ORT_TENSORRT_EXTRA_PLUGIN_LIB_PATHS'] = PLUGIN_LIB_PATHS
 TRT_BACKEND='POLYGRAPHY'
 DEBUG=False
 
