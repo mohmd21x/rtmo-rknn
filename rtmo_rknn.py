@@ -732,12 +732,11 @@ class RTMO_RKNN:
         self._rknn_input_pass_through = False
 
         env_mode = os.environ.get("RTMO_RKNN_INPUT", "").strip().lower()
-        if env_mode in {"float", "float32"}:
-            self._rknn_input_dtype = np.float32
-            self._rknn_input_pass_through = True
-        elif env_mode == "float16":
-            self._rknn_input_dtype = np.float16
-            self._rknn_input_pass_through = True
+        if self.backend == "device" and env_mode:
+            print(
+                "[WARN] RTMO_RKNN_INPUT is ignored on device (causes segfault). "
+                "Using uint8 NHWC; do not set RTMO_RKNN_INPUT=float32."
+            )
 
         try:
             if hasattr(self.rknn, "get_input_detail"):
@@ -753,25 +752,37 @@ class RTMO_RKNN:
                     dtype_name = str(
                         detail.get("dtype", detail.get("type", ""))
                     ).lower()
-                    if env_mode:
-                        pass
-                    elif "uint8" in dtype_name:
+                    if "uint8" in dtype_name:
                         self._rknn_input_dtype = np.uint8
                         self._rknn_input_pass_through = False
                     elif "float16" in dtype_name:
                         self._rknn_input_dtype = np.float16
-                        self._rknn_input_pass_through = True
+                        self._rknn_input_pass_through = False
                     elif "float32" in dtype_name or dtype_name.endswith("float"):
                         self._rknn_input_dtype = np.float32
-                        self._rknn_input_pass_through = True
+                        self._rknn_input_pass_through = False
         except Exception as exc:
             print(f"[WARN] Could not query RKNN input attributes: {exc}")
+
+        self._log_rknn_io_details()
 
         print(
             f"[INFO] RKNN input: layout={self._rknn_input_layout}, "
             f"dtype={self._rknn_dtype_str()}, "
             f"pass_through={self._rknn_input_pass_through}"
         )
+
+    def _log_rknn_io_details(self) -> None:
+        if self.rknn is None or self.backend == "onnx":
+            return
+        for method_name in ("get_input_detail", "get_output_detail", "get_sdk_version"):
+            if not hasattr(self.rknn, method_name):
+                continue
+            try:
+                detail = getattr(self.rknn, method_name)()
+                print(f"[INFO] RKNN {method_name}: {detail}")
+            except Exception as exc:
+                print(f"[WARN] RKNN {method_name} failed: {exc}")
 
     def _rknn_dtype_str(self) -> str:
         if self._rknn_input_dtype == np.float32:
@@ -842,40 +853,45 @@ class RTMO_RKNN:
                 f"dtype={inp.dtype}, layout={self._rknn_input_layout}"
             )
 
-        dtype_name = self._rknn_dtype_str()
-        pass_through = [1 if self._rknn_input_pass_through else 0]
-        call_variants = [
-            dict(
-                inputs=[inp],
-                data_type=dtype_name,
-                data_format=self._rknn_input_layout,
-                inputs_pass_through=pass_through,
-            ),
-            dict(
-                inputs=[inp],
-                data_type=dtype_name,
-                data_format=self._rknn_input_layout,
-            ),
-            dict(inputs=[inp], data_type=dtype_name),
-            dict(inputs=[inp]),
-        ]
+        if self.backend == "device":
+            # rknnlite default: uint8 NHWC 4D, mean/std applied by runtime.
+            outputs = self.rknn.inference(inputs=[inp], data_type="uint8")
+        else:
+            dtype_name = self._rknn_dtype_str()
+            pass_through = [1 if self._rknn_input_pass_through else 0]
+            call_variants = [
+                dict(
+                    inputs=[inp],
+                    data_type=dtype_name,
+                    data_format=self._rknn_input_layout,
+                    inputs_pass_through=pass_through,
+                ),
+                dict(
+                    inputs=[inp],
+                    data_type=dtype_name,
+                    data_format=self._rknn_input_layout,
+                ),
+                dict(inputs=[inp], data_type=dtype_name),
+                dict(inputs=[inp]),
+            ]
 
-        outputs = None
-        last_exc: Optional[Exception] = None
-        for kwargs in call_variants:
-            try:
-                outputs = self.rknn.inference(**kwargs)
-                break
-            except (TypeError, ValueError) as exc:
-                last_exc = exc
-                continue
+            outputs = None
+            last_exc: Optional[Exception] = None
+            for kwargs in call_variants:
+                try:
+                    outputs = self.rknn.inference(**kwargs)
+                    break
+                except (TypeError, ValueError) as exc:
+                    last_exc = exc
+                    continue
 
-        if outputs is None and last_exc is not None:
-            raise RuntimeError(f"RKNN inference failed: {last_exc}") from last_exc
+            if outputs is None and last_exc is not None:
+                raise RuntimeError(f"RKNN inference failed: {last_exc}") from last_exc
+
         if outputs is None:
             raise RuntimeError(
                 "RKNN inference returned None. Check input layout/dtype "
-                f"(expected 4D {self._rknn_input_layout}, dtype={dtype_name})."
+                f"(expected 4D NHWC uint8 for device)."
             )
         if self._debug:
             print(f"[DEBUG] rknn inference outputs={len(outputs)} tensors")

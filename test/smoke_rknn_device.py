@@ -50,9 +50,16 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if args.debug:
-        import os
+    import os
 
+    if os.environ.get("RTMO_RKNN_INPUT", "").strip():
+        print(
+            "[ERROR] Unset RTMO_RKNN_INPUT on the board. "
+            "float32 input segfaults rknnlite; use default uint8:\n"
+            "  python3 test/smoke_rknn_device.py --rknn convert/models/rtmo-m.fp16.rknn --frames 1"
+        )
+        sys.exit(1)
+    if args.debug:
         os.environ["RTMO_RKNN_DEBUG"] = "1"
     if not args.rknn.exists():
         raise FileNotFoundError(f"RKNN model not found: {args.rknn}")
