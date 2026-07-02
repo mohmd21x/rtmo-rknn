@@ -17,7 +17,10 @@ if str(ROOT) not in sys.path:
 if str(ROOT / "rtmo") not in sys.path:
     sys.path.insert(0, str(ROOT / "rtmo"))
 
-from rtmo_gpu import RTMO_GPU, coco17  # noqa: E402
+# coco17 is needed for keypoint names even in rknn-only mode; RTMO_GPU is imported
+# lazily inside run_benchmark so that aarch64 boards without CUDA/TRT don't crash
+# at import time when --rknn_only is used.
+from rtmo_gpu import coco17  # noqa: E402
 from rtmo_rknn import RTMO_RKNN  # noqa: E402
 
 
@@ -97,6 +100,16 @@ def parse_args() -> argparse.Namespace:
         default=0.15,
         help="RKNN detection score threshold (try 0.05 on PC simulator if no detections)",
     )
+    parser.add_argument(
+        "--rknn_only",
+        type=str2bool,
+        default=False,
+        help=(
+            "Skip ONNX inference entirely and only benchmark RKNN speed. "
+            "Use on the board when onnxruntime crashes (e.g. no CUDA/TRT libs). "
+            "Keypoint accuracy columns will be omitted from the report."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -105,7 +118,11 @@ def keypoint_names() -> List[str]:
 
 
 def run_benchmark(args: argparse.Namespace) -> Dict[str, object]:
-    for path_value, label in ((args.video, "video"), (args.onnx, "onnx"), (args.rknn, "rknn")):
+    paths_to_check = [(args.video, "video"), (args.rknn, "rknn")]
+    if not args.rknn_only:
+        paths_to_check.insert(1, (args.onnx, "onnx"))
+
+    for path_value, label in paths_to_check:
         if not path_value.exists():
             if label == "rknn":
                 raise FileNotFoundError(
@@ -130,7 +147,11 @@ def run_benchmark(args: argparse.Namespace) -> Dict[str, object]:
     else:
         total_to_process = total_video_frames if total_video_frames > 0 else None
 
-    onnx_model = RTMO_GPU(model=str(args.onnx), device=args.onnx_device)
+    onnx_model = None
+    if not args.rknn_only:
+        from rtmo_gpu import RTMO_GPU  # deferred: avoid crashing on aarch64 without CUDA/TRT
+        onnx_model = RTMO_GPU(model=str(args.onnx), device=args.onnx_device)
+
     rknn_model = RTMO_RKNN(
         model_path=str(args.rknn),
         target=args.target,
@@ -163,32 +184,37 @@ def run_benchmark(args: argparse.Namespace) -> Dict[str, object]:
             if not ok:
                 break
 
-            onnx_start = time.perf_counter()
-            onnx_bboxes, _, onnx_keypoints, _ = onnx_model(frame)
-            onnx_ms = (time.perf_counter() - onnx_start) * 1000.0
-            onnx_ms_values.append(onnx_ms)
+            if onnx_model is not None:
+                onnx_start = time.perf_counter()
+                onnx_bboxes, _, onnx_keypoints, _ = onnx_model(frame)
+                onnx_ms = (time.perf_counter() - onnx_start) * 1000.0
+                onnx_ms_values.append(onnx_ms)
+            else:
+                onnx_bboxes = []
+                onnx_keypoints = []
 
             rknn_start = time.perf_counter()
             _, rknn_bboxes, _, rknn_keypoints, _ = rknn_model(frame)
             rknn_ms = (time.perf_counter() - rknn_start) * 1000.0
             rknn_ms_values.append(rknn_ms)
 
-            onnx_people = len(onnx_bboxes)
-            rknn_people = len(rknn_bboxes)
+            if onnx_model is not None:
+                onnx_people = len(onnx_bboxes)
+                rknn_people = len(rknn_bboxes)
 
-            if onnx_people > 0 and rknn_people > 0:
-                valid_frames += 1
-                matched_people = min(onnx_people, rknn_people)
-                onnx_kpts = np.asarray(onnx_keypoints[:matched_people], dtype=np.float64)
-                rknn_kpts = np.asarray(rknn_keypoints[:matched_people], dtype=np.float64)
+                if onnx_people > 0 and rknn_people > 0:
+                    valid_frames += 1
+                    matched_people = min(onnx_people, rknn_people)
+                    onnx_kpts = np.asarray(onnx_keypoints[:matched_people], dtype=np.float64)
+                    rknn_kpts = np.asarray(rknn_keypoints[:matched_people], dtype=np.float64)
 
-                diffs = onnx_kpts - rknn_kpts
-                l2 = np.linalg.norm(diffs, axis=2)
-                mae = np.mean(np.abs(diffs), axis=2)
+                    diffs = onnx_kpts - rknn_kpts
+                    l2 = np.linalg.norm(diffs, axis=2)
+                    mae = np.mean(np.abs(diffs), axis=2)
 
-                l2_sum += np.sum(l2, axis=0)
-                mae_sum += np.sum(mae, axis=0)
-                sample_count += l2.shape[0]
+                    l2_sum += np.sum(l2, axis=0)
+                    mae_sum += np.sum(mae, axis=0)
+                    sample_count += l2.shape[0]
 
             processed_frames += 1
             progress.update(1)
@@ -220,57 +246,70 @@ def run_benchmark(args: argparse.Namespace) -> Dict[str, object]:
         "rknn_fps_mean": (1000.0 / rknn_ms_mean) if rknn_ms_mean > 0 else 0.0,
         "processed_frames": processed_frames,
         "valid_frames": valid_frames,
+        "rknn_only": args.rknn_only,
     }
 
 
-def write_csv(output_path: Path, metrics_rows, onnx_ms_mean: float, rknn_ms_mean: float) -> None:
+def write_csv(output_path: Path, results: Dict[str, object]) -> None:
+    rknn_only = results.get("rknn_only", False)
     with output_path.open("w", newline="", encoding="utf-8") as csv_file:
         writer = csv.writer(csv_file)
-        writer.writerow(["keypoint_name", "mean_l2", "mae", "onnx_ms", "rknn_ms"])
-        for keypoint_name, mean_l2, mean_mae in metrics_rows:
-            writer.writerow([keypoint_name, mean_l2, mean_mae, onnx_ms_mean, rknn_ms_mean])
+        if rknn_only:
+            writer.writerow(["rknn_ms", "rknn_fps"])
+            writer.writerow([results["rknn_ms_mean"], results["rknn_fps_mean"]])
+        else:
+            writer.writerow(["keypoint_name", "mean_l2", "mae", "onnx_ms", "rknn_ms"])
+            for keypoint_name, mean_l2, mean_mae in results["metrics_rows"]:
+                writer.writerow(
+                    [keypoint_name, mean_l2, mean_mae, results["onnx_ms_mean"], results["rknn_ms_mean"]]
+                )
 
 
 def print_report(results: Dict[str, object], output_path: Path) -> None:
-    table_rows = []
-    for keypoint_name, mean_l2, mean_mae in results["metrics_rows"]:
-        table_rows.append(
-            [
-                keypoint_name,
-                f"{mean_l2:.4f}" if np.isfinite(mean_l2) else "nan",
-                f"{mean_mae:.4f}" if np.isfinite(mean_mae) else "nan",
-                f"{results['onnx_ms_mean']:.2f}",
-                f"{results['rknn_ms_mean']:.2f}",
-            ]
+    rknn_only = results.get("rknn_only", False)
+
+    print("\n=== RKNN Benchmark ===" if rknn_only else "\n=== ONNX vs RKNN Keypoint Benchmark ===")
+    print(f"Frames processed: {results['processed_frames']}")
+
+    if not rknn_only:
+        print(f"Valid overlap frames: {results['valid_frames']}")
+        print(
+            f"Mean ONNX inference: {results['onnx_ms_mean']:.2f} ms "
+            f"({results['onnx_fps_mean']:.2f} FPS)"
         )
 
-    print("\n=== ONNX vs RKNN Keypoint Benchmark ===")
-    print(
-        f"Frames processed: {results['processed_frames']} "
-        f"(valid overlap frames: {results['valid_frames']})"
-    )
-    print(
-        f"Mean ONNX inference: {results['onnx_ms_mean']:.2f} ms "
-        f"({results['onnx_fps_mean']:.2f} FPS)"
-    )
     print(
         f"Mean RKNN inference: {results['rknn_ms_mean']:.2f} ms "
         f"({results['rknn_fps_mean']:.2f} FPS)"
     )
-    print(
-        tabulate(
-            table_rows,
-            headers=["keypoint_name", "mean_l2", "mae", "onnx_ms", "rknn_ms"],
-            tablefmt="github",
+
+    if not rknn_only:
+        table_rows = []
+        for keypoint_name, mean_l2, mean_mae in results["metrics_rows"]:
+            table_rows.append(
+                [
+                    keypoint_name,
+                    f"{mean_l2:.4f}" if np.isfinite(mean_l2) else "nan",
+                    f"{mean_mae:.4f}" if np.isfinite(mean_mae) else "nan",
+                    f"{results['onnx_ms_mean']:.2f}",
+                    f"{results['rknn_ms_mean']:.2f}",
+                ]
+            )
+        print(
+            tabulate(
+                table_rows,
+                headers=["keypoint_name", "mean_l2", "mae", "onnx_ms", "rknn_ms"],
+                tablefmt="github",
+            )
         )
-    )
+
     print(f"\n[INFO] CSV written to: {output_path}")
 
 
 def main() -> None:
     args = parse_args()
     results = run_benchmark(args)
-    write_csv(args.output, results["metrics_rows"], results["onnx_ms_mean"], results["rknn_ms_mean"])
+    write_csv(args.output, results)
     print_report(results, args.output)
 
 
