@@ -26,34 +26,30 @@ from onnx import numpy_helper
 
 
 # ---------------------------------------------------------------------------
-# Pre-NMS cut points  (verified by shape-inference on both model files)
+# Pre-NMS cut points (before ONNX TopK — TopK segfaults on RK3588 NPU).
 # Output shapes after cut, for a 640×640 input:
-#   bboxes        (1, 2000, 4)   NMS boxes tensor (score-sorted anchor order)
-#   scores        (1, 1, 2000)   NMS scores tensor (matches bboxes)
-#   pose_vecs     (1, 2000, C)   raw anchor order — reorder with sort_indices
-#   kpt_vis       (1, 2000, 17)  raw anchor order — reorder with sort_indices
-#   priors        (1, 2000, 2)   raw anchor order — not used for CPU DCC decode
-#   sort_indices  (1, 2000)      topk_inds: raw anchor index for each sorted slot
+#   bboxes     (1, 2000, 4)   y.3 — anchor boxes in raw order (CPU TopK sorts)
+#   scores     (1, 2000)      max_scores — per-anchor scores in raw order
+#   pose_vecs  (1, 2000, C)   raw anchor order
+#   kpt_vis    (1, 2000, 17)  raw anchor order
+#   priors     (1, 2000, 2)    raw anchor order (not used for DCC decode)
 #
-# NOTE: Do NOT cut at y.3 / onnx::Transpose_* — those are misaligned with each
-# other.  Use the same tensors fed to NonMaxSuppression (boxes, scores).
+# sort_indices are computed on CPU in rtmo_rknn.py (np.argsort on scores).
 # ---------------------------------------------------------------------------
 CUT_TENSORS: Dict[str, Dict[str, str]] = {
     "rtmo-s": {
-        "bboxes":        "boxes",
-        "scores":        "scores",
+        "bboxes":        "y.3",
+        "scores":        "max_scores",
         "pose_vecs":     "onnx::Shape_1089",
         "kpt_vis":       "onnx::Shape_1117",
         "priors":        "onnx::Add_1125",
-        "sort_indices":  "topk_inds",
     },
     "rtmo-m": {
-        "bboxes":        "boxes",
-        "scores":        "scores",
+        "bboxes":        "y.3",
+        "scores":        "max_scores",
         "pose_vecs":     "onnx::Shape_1276",
         "kpt_vis":       "onnx::Shape_1304",
         "priors":        "onnx::Add_1312",
-        "sort_indices":  "topk_inds",
     },
 }
 
@@ -393,7 +389,17 @@ def export_no_nms(
         raise RuntimeError(
             f"NMS nodes still present after cut: {nms_remaining}"
         )
-    print(f"[INFO]   no NMS nodes — OK")
+    topk_remaining = [
+        n.name or "(unnamed)"
+        for n in sub.graph.node
+        if n.op_type == "TopK"
+    ]
+    if topk_remaining:
+        raise RuntimeError(
+            f"TopK nodes still present after cut (RK3588 NPU segfaults on TopK): "
+            f"{topk_remaining}"
+        )
+    print(f"[INFO]   no NMS / TopK nodes — OK")
     print(f"[INFO]   ONNX model   → {out_onnx}")
 
 

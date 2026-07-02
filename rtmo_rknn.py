@@ -488,6 +488,60 @@ def _outputs_to_dict(
     return {name: out for name, out in zip(output_names, outputs)}
 
 
+def _cpu_topk_sort_indices(scores: np.ndarray) -> np.ndarray:
+    """Match ONNX TopK(topk_inds): descending sort of all anchor scores."""
+    scores_flat = np.asarray(scores, dtype=np.float32).reshape(-1)
+    return np.argsort(-scores_flat, kind="stable").astype(np.int64)
+
+
+def _parse_no_nms_output_dict(
+    parsed: Dict[str, np.ndarray],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    if len(parsed) == 5:
+        bboxes_raw = np.asarray(parsed["bboxes"], dtype=np.float32).reshape(-1, 4)
+        scores_raw = np.asarray(parsed["scores"], dtype=np.float32).reshape(-1)
+        pose_vecs = np.asarray(parsed["pose_vecs"], dtype=np.float32).reshape(
+            bboxes_raw.shape[0], -1
+        )
+        kpt_vis = np.asarray(parsed["kpt_vis"], dtype=np.float32).reshape(
+            bboxes_raw.shape[0], NUM_KEYPOINTS
+        )
+        priors = np.asarray(parsed["priors"], dtype=np.float32).reshape(
+            bboxes_raw.shape[0], 2
+        )
+        sort_indices = _cpu_topk_sort_indices(scores_raw)
+        bboxes = bboxes_raw[sort_indices]
+        scores = scores_raw[sort_indices]
+        pose_vecs = _reorder_by_sort_indices(pose_vecs, sort_indices)
+        kpt_vis = _reorder_by_sort_indices(kpt_vis, sort_indices)
+        priors = _reorder_by_sort_indices(priors, sort_indices)
+        return bboxes, scores, pose_vecs, kpt_vis, priors, sort_indices
+
+    if len(parsed) != 6:
+        raise ValueError(
+            f"Expected 5 or 6 no-NMS outputs, got {len(parsed)}. "
+            "Re-export with convert/export_no_nms.py."
+        )
+
+    bboxes = np.asarray(parsed["bboxes"], dtype=np.float32).reshape(-1, 4)
+    scores = np.asarray(parsed["scores"], dtype=np.float32).reshape(-1)
+    pose_vecs = np.asarray(parsed["pose_vecs"], dtype=np.float32).reshape(
+        bboxes.shape[0], -1
+    )
+    kpt_vis = np.asarray(parsed["kpt_vis"], dtype=np.float32).reshape(
+        bboxes.shape[0], NUM_KEYPOINTS
+    )
+    priors = np.asarray(parsed["priors"], dtype=np.float32).reshape(
+        bboxes.shape[0], 2
+    )
+    sort_indices = np.asarray(parsed["sort_indices"], dtype=np.int64).reshape(-1)
+
+    pose_vecs = _reorder_by_sort_indices(pose_vecs, sort_indices)
+    kpt_vis = _reorder_by_sort_indices(kpt_vis, sort_indices)
+    priors = _reorder_by_sort_indices(priors, sort_indices)
+    return bboxes, scores, pose_vecs, kpt_vis, priors, sort_indices
+
+
 def match_detections_by_iou(
     onnx_boxes: np.ndarray,
     rknn_boxes: np.ndarray,
@@ -836,36 +890,7 @@ class RTMO_RKNN:
             self.onnx_output_names if self.backend == "onnx" else None
         )
         parsed = _outputs_to_dict(outputs, output_names)
-
-        if len(parsed) not in {5, 6}:
-            raise ValueError(
-                f"Expected 5 or 6 RKNN outputs, got {len(parsed)}. "
-                "Re-export no-NMS ONNX with convert/export_no_nms.py."
-            )
-        if len(parsed) == 5:
-            raise ValueError(
-                "This no-NMS ONNX was exported with misaligned cut points "
-                "(y.3 / Transpose scores). Re-export with:\n"
-                "  python convert/export_no_nms.py --model rtmo/rtmo-<s|m>.onnx"
-            )
-
-        bboxes = np.asarray(parsed["bboxes"], dtype=np.float32).reshape(-1, 4)
-        scores = np.asarray(parsed["scores"], dtype=np.float32).reshape(-1)
-        pose_vecs = np.asarray(parsed["pose_vecs"], dtype=np.float32).reshape(
-            bboxes.shape[0], -1
-        )
-        kpt_vis = np.asarray(parsed["kpt_vis"], dtype=np.float32).reshape(
-            bboxes.shape[0], NUM_KEYPOINTS
-        )
-        priors = np.asarray(parsed["priors"], dtype=np.float32).reshape(
-            bboxes.shape[0], 2
-        )
-        sort_indices = np.asarray(parsed["sort_indices"], dtype=np.int64).reshape(-1)
-
-        pose_vecs = _reorder_by_sort_indices(pose_vecs, sort_indices)
-        kpt_vis = _reorder_by_sort_indices(kpt_vis, sort_indices)
-        priors = _reorder_by_sort_indices(priors, sort_indices)
-        return bboxes, scores, pose_vecs, kpt_vis, priors, sort_indices
+        return _parse_no_nms_output_dict(parsed)
 
     def postprocess(
         self, outputs: List[np.ndarray], ratio: float = 1.0
