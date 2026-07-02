@@ -296,13 +296,17 @@ def is_trt_engine(model_path):
         return False
 
 def get_onnx_input_shapes(model_path):
-    from polygraphy.backend.onnx.loader import OnnxFromPath
-    from polygraphy.backend.onnx import infer_shapes
-    model = OnnxFromPath(model_path)()
-    model = infer_shapes(model)
-    input_shapes = {inp.name: inp.type.tensor_type.shape for inp in model.graph.input}
-    return {name: [dim.dim_value if dim.dim_value > 0 else 'Dynamic' for dim in shape_proto.dim] 
-            for name, shape_proto in input_shapes.items()}
+    session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+    input_shapes = {}
+    for inp in session.get_inputs():
+        shape = []
+        for dim in inp.shape:
+            if isinstance(dim, int) and dim > 0:
+                shape.append(dim)
+            else:
+                shape.append('Dynamic')
+        input_shapes[inp.name] = shape
+    return input_shapes
 
 def get_trt_input_shapes(model_path):
     input_shapes = {}

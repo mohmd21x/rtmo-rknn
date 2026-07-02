@@ -5,7 +5,7 @@ tqdm
 tabulate
 
 # Optional: only if you run ONNX side-by-side compare/benchmark on the board
-# onnxruntime
+onnxruntime
 
 # Install rknnlite2 from Rockchip's wheel for your board Python version, e.g.:
 #   pip install rknnlite2-*.whl

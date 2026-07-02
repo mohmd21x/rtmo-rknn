@@ -579,7 +579,8 @@ class RTMO_RKNN:
             if ret != 0:
                 raise RuntimeError(f"Failed to load RKNN model: ret={ret}")
 
-            ret = self.rknn.init_runtime(target=self.target, device_id=self.device_id)
+            # On-board: init locally. target/device_id are for remote ADB from a PC.
+            ret = self.rknn.init_runtime()
             if ret != 0:
                 raise RuntimeError(f"Failed to init RKNN device runtime: ret={ret}")
 
