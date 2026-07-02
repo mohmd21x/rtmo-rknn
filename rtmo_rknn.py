@@ -653,7 +653,14 @@ class RTMO_RKNN:
                 raise RuntimeError(f"Failed to load RKNN model: ret={ret}")
 
             # On-board: init locally. target/device_id are for remote ADB from a PC.
-            ret = self.rknn.init_runtime()
+            try:
+                from rknnlite.api import RKNNLite as _RKNNLite
+
+                ret = self.rknn.init_runtime(
+                    core_mask=_RKNNLite.NPU_CORE_AUTO,
+                )
+            except (AttributeError, TypeError):
+                ret = self.rknn.init_runtime()
             if ret != 0:
                 raise RuntimeError(f"Failed to init RKNN device runtime: ret={ret}")
 
@@ -680,16 +687,28 @@ class RTMO_RKNN:
         return padded_img, ratio
 
     def inference(self, img: np.ndarray) -> List[np.ndarray]:
-        if img.ndim == 3:
-            img = np.expand_dims(img, axis=0)
         if self.backend == "onnx":
+            if img.ndim == 3:
+                img = np.expand_dims(img, axis=0)
             inp = np.ascontiguousarray(img.transpose(0, 3, 1, 2), dtype=np.float32)
             outputs = self.onnx_session.run(None, {"input": inp})
             return outputs
+
+        # rknnlite / rknn-toolkit simulator expect uint8 HWC (no batch dim).
+        if img.ndim == 4:
+            if img.shape[0] != 1:
+                raise ValueError(
+                    f"RKNN inference expects batch size 1, got shape {img.shape}"
+                )
+            img = img[0]
+        elif img.ndim != 3:
+            raise ValueError(f"RKNN inference expects HWC image, got shape {img.shape}")
+
+        inp = np.ascontiguousarray(img, dtype=np.uint8)
         try:
-            outputs = self.rknn.inference(inputs=[img], data_format=["nhwc"])
+            outputs = self.rknn.inference(inputs=[inp], data_format=["nhwc"])
         except TypeError:
-            outputs = self.rknn.inference(inputs=[img])
+            outputs = self.rknn.inference(inputs=[inp])
         return outputs
 
     def _parse_no_nms_outputs(

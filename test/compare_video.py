@@ -14,8 +14,13 @@ if str(ROOT) not in sys.path:
 if str(ROOT / "rtmo") not in sys.path:
     sys.path.insert(0, str(ROOT / "rtmo"))
 
-from rtmo_gpu import RTMO_GPU, draw_bbox, draw_skeleton  # noqa: E402
 from rtmo_rknn import RTMO_RKNN  # noqa: E402
+
+
+def _import_rtmo_gpu():
+    from rtmo_gpu import RTMO_GPU, draw_bbox, draw_skeleton  # noqa: E402
+
+    return RTMO_GPU, draw_bbox, draw_skeleton
 
 
 def str2bool(value: str) -> bool:
@@ -111,6 +116,19 @@ def parse_args() -> argparse.Namespace:
         help="Keypoint visibility threshold for drawing skeletons (default 0.1)",
     )
     parser.add_argument(
+        "--rknn_only",
+        action="store_true",
+        help=(
+            "Run RKNN only (required on RK3588 — full ONNX uses mmdeploy NMS ops and "
+            "often segfaults on the board)"
+        ),
+    )
+    parser.add_argument(
+        "--with_onnx",
+        action="store_true",
+        help="Force side-by-side full ONNX on RK3588 (not recommended; may crash)",
+    )
+    parser.add_argument(
         "--count_csv",
         type=Path,
         default=None,
@@ -139,12 +157,16 @@ def annotate_panel(
     label: str,
     inference_ms: float,
     kpt_thr: float = 0.1,
+    draw_bbox_fn=None,
+    draw_skeleton_fn=None,
 ) -> Any:
+    if draw_bbox_fn is None or draw_skeleton_fn is None:
+        _, draw_bbox_fn, draw_skeleton_fn = _import_rtmo_gpu()
     panel = frame.copy()
     if len(keypoints) > 0:
-        panel = draw_skeleton(panel, keypoints, kpt_scores, kpt_thr=kpt_thr)
+        panel = draw_skeleton_fn(panel, keypoints, kpt_scores, kpt_thr=kpt_thr)
     if len(bboxes) > 0:
-        panel = draw_bbox(panel, bboxes, bbox_scores)
+        panel = draw_bbox_fn(panel, bboxes, bbox_scores)
     fps = 1000.0 / inference_ms if inference_ms > 0 else 0.0
     line1 = f"{label} | {inference_ms:.1f} ms | {fps:.1f} FPS | dets: {len(bboxes)}"
     cv2.putText(
@@ -161,7 +183,7 @@ def annotate_panel(
 
 
 def infer_onnx(
-    model: RTMO_GPU, frame, kpt_thr: float
+    model, frame, kpt_thr: float, draw_bbox_fn=None, draw_skeleton_fn=None
 ) -> Tuple[Any, float, float, int]:
     start = time.perf_counter()
     bboxes, bbox_scores, keypoints, kpt_scores = model(frame)
@@ -175,6 +197,8 @@ def infer_onnx(
         "FULL ONNX",
         inference_ms,
         kpt_thr,
+        draw_bbox_fn=draw_bbox_fn,
+        draw_skeleton_fn=draw_skeleton_fn,
     )
     fps = 1000.0 / inference_ms if inference_ms > 0 else 0.0
     return panel, inference_ms, fps, len(bboxes)
@@ -217,12 +241,22 @@ def print_speed_summary(
     onnx_ms: List[float],
     rknn_ms: List[float],
     rknn_label: str,
+    rknn_only: bool = False,
 ) -> None:
-    if not onnx_ms or not rknn_ms:
+    if not rknn_ms:
         return
-    onnx_mean = sum(onnx_ms) / len(onnx_ms)
     rknn_mean = sum(rknn_ms) / len(rknn_ms)
     print("\n=== Inference speed (same video) ===")
+    if rknn_only:
+        print(
+            f"{rknn_label}: mean {rknn_mean:.2f} ms "
+            f"({1000.0 / rknn_mean:.2f} FPS) | "
+            f"min {min(rknn_ms):.2f} ms | max {max(rknn_ms):.2f} ms"
+        )
+        return
+    if not onnx_ms:
+        return
+    onnx_mean = sum(onnx_ms) / len(onnx_ms)
     print(
         f"FULL ONNX: mean {onnx_mean:.2f} ms "
         f"({1000.0 / onnx_mean:.2f} FPS) | "
@@ -241,20 +275,30 @@ def print_det_count_summary(
     onnx_counts: List[int],
     rknn_counts: List[int],
     rknn_label: str,
+    rknn_only: bool = False,
 ) -> None:
-    n = len(onnx_counts)
+    n = len(rknn_counts)
     if n == 0:
         return
 
-    onnx_arr = onnx_counts
     rknn_arr = rknn_counts
-    match_frames = sum(1 for o, r in zip(onnx_arr, rknn_arr) if o == r)
-    onnx_detect_frames = sum(1 for c in onnx_arr if c > 0)
     rknn_detect_frames = sum(1 for c in rknn_arr if c > 0)
-    both_detect_frames = sum(1 for o, r in zip(onnx_arr, rknn_arr) if o > 0 and r > 0)
 
     print("\n=== Bbox count summary (same video) ===")
     print(f"Frames processed: {n}")
+    if rknn_only:
+        print(f"Frames with detections: {rknn_label}={rknn_detect_frames}")
+        print(
+            f"{rknn_label} count/frame: min={min(rknn_arr)}, max={max(rknn_arr)}, "
+            f"mean={sum(rknn_arr) / n:.2f}, total={sum(rknn_arr)}"
+        )
+        return
+
+    onnx_arr = onnx_counts
+    match_frames = sum(1 for o, r in zip(onnx_arr, rknn_arr) if o == r)
+    onnx_detect_frames = sum(1 for c in onnx_arr if c > 0)
+    both_detect_frames = sum(1 for o, r in zip(onnx_arr, rknn_arr) if o > 0 and r > 0)
+
     print(f"Frames with detections: ONNX={onnx_detect_frames}, {rknn_label}={rknn_detect_frames}")
     print(f"Frames with both >0 detections: {both_detect_frames}")
     print(f"Frames with matching counts: {match_frames} ({100.0 * match_frames / n:.1f}%)")
@@ -284,7 +328,22 @@ def print_det_count_summary(
 
 def main() -> None:
     args = parse_args()
-    for path_value, label in ((args.video, "video"), (args.onnx, "onnx"), (args.rknn, "rknn")):
+    if args.rknn_backend is None:
+        rknn_backend = "simulator" if args.use_simulator else "device"
+    else:
+        rknn_backend = args.rknn_backend
+
+    rknn_only = args.rknn_only or (rknn_backend == "device" and not args.with_onnx)
+    if rknn_backend == "device" and not args.rknn_only and not args.with_onnx:
+        print(
+            "[INFO] RK3588 device backend: skipping full ONNX (use --with_onnx to force "
+            "side-by-side; may segfault). Running --rknn_only."
+        )
+
+    required_paths = [(args.video, "video"), (args.rknn, "rknn")]
+    if not rknn_only:
+        required_paths.insert(1, (args.onnx, "onnx"))
+    for path_value, label in required_paths:
         if not path_value.exists():
             if label == "rknn":
                 raise FileNotFoundError(
@@ -309,25 +368,28 @@ def main() -> None:
     if fps <= 0:
         fps = 30.0
 
+    out_width = width if rknn_only else width * 2
     writer = cv2.VideoWriter(
         str(args.output),
         cv2.VideoWriter_fourcc(*"mp4v"),
         fps,
-        (width * 2, height),
+        (out_width, height),
     )
     if not writer.isOpened():
         raise RuntimeError(f"Failed to open video writer: {args.output}")
 
-    onnx_model = RTMO_GPU(model=str(args.onnx), device=args.onnx_device)
+    onnx_model = None
+    draw_bbox_fn = None
+    draw_skeleton_fn = None
+    if not rknn_only:
+        RTMO_GPU, draw_bbox_fn, draw_skeleton_fn = _import_rtmo_gpu()
+        onnx_model = RTMO_GPU(model=str(args.onnx), device=args.onnx_device)
+
     score_threshold = (
         args.score_threshold
         if args.score_threshold is not None
         else 0.3
     )
-    if args.rknn_backend is None:
-        rknn_backend = "simulator" if args.use_simulator else "device"
-    else:
-        rknn_backend = args.rknn_backend
     rknn_model = RTMO_RKNN(
         model_path=str(args.rknn),
         target=args.target,
@@ -336,11 +398,11 @@ def main() -> None:
         score_threshold=score_threshold,
     )
     print(
-        f"[INFO] RKNN backend={rknn_backend}, score_threshold={score_threshold}, "
-        f"kpt_thr={args.kpt_thr}"
+        f"[INFO] RKNN backend={rknn_backend}, rknn_only={rknn_only}, "
+        f"score_threshold={score_threshold}, kpt_thr={args.kpt_thr}"
     )
     rknn_label = _rknn_display_label(rknn_backend)
-    if score_threshold < 0.3:
+    if not rknn_only and score_threshold < 0.3:
         print(
             "[WARN] score_threshold < 0.3: RKNN will keep extra low-score boxes. "
             "Full ONNX (rtmo_gpu) filters detections with score > 0.3. "
@@ -357,36 +419,54 @@ def main() -> None:
         if args.count_csv is not None
         else args.output.with_name(f"{args.output.stem}_det_counts.csv")
     )
+    window_title = rknn_label if rknn_only else "ONNX vs RKNN"
     try:
         while True:
             ok, frame = cap.read()
             if not ok:
                 break
 
-            onnx_panel, onnx_ms, onnx_fps, onnx_n = infer_onnx(
-                onnx_model, frame, args.kpt_thr
-            )
-            rknn_panel, rknn_ms, rknn_fps, rknn_n = infer_rknn(
-                rknn_model, frame, args.kpt_thr, panel_label=rknn_label
-            )
-            onnx_det_counts.append(onnx_n)
-            rknn_det_counts.append(rknn_n)
-            onnx_ms_values.append(onnx_ms)
-            rknn_ms_values.append(rknn_ms)
-
-            if frame_count == 0:
-                print(
-                    f"[INFO] frame 0: FULL ONNX {onnx_ms:.1f} ms ({onnx_fps:.1f} FPS), "
-                    f"dets={onnx_n} | {rknn_label} {rknn_ms:.1f} ms ({rknn_fps:.1f} FPS), "
-                    f"dets={rknn_n}"
+            if rknn_only:
+                rknn_panel, rknn_ms, rknn_fps, rknn_n = infer_rknn(
+                    rknn_model, frame, args.kpt_thr, panel_label=rknn_label
                 )
-            combined = cv2.hconcat([onnx_panel, rknn_panel])
+                rknn_det_counts.append(rknn_n)
+                rknn_ms_values.append(rknn_ms)
+                if frame_count == 0:
+                    print(
+                        f"[INFO] frame 0: {rknn_label} {rknn_ms:.1f} ms "
+                        f"({rknn_fps:.1f} FPS), dets={rknn_n}"
+                    )
+                combined = rknn_panel
+            else:
+                onnx_panel, onnx_ms, onnx_fps, onnx_n = infer_onnx(
+                    onnx_model,
+                    frame,
+                    args.kpt_thr,
+                    draw_bbox_fn=draw_bbox_fn,
+                    draw_skeleton_fn=draw_skeleton_fn,
+                )
+                rknn_panel, rknn_ms, rknn_fps, rknn_n = infer_rknn(
+                    rknn_model, frame, args.kpt_thr, panel_label=rknn_label
+                )
+                onnx_det_counts.append(onnx_n)
+                rknn_det_counts.append(rknn_n)
+                onnx_ms_values.append(onnx_ms)
+                rknn_ms_values.append(rknn_ms)
+
+                if frame_count == 0:
+                    print(
+                        f"[INFO] frame 0: FULL ONNX {onnx_ms:.1f} ms ({onnx_fps:.1f} FPS), "
+                        f"dets={onnx_n} | {rknn_label} {rknn_ms:.1f} ms ({rknn_fps:.1f} FPS), "
+                        f"dets={rknn_n}"
+                    )
+                combined = cv2.hconcat([onnx_panel, rknn_panel])
 
             writer.write(combined)
             frame_count += 1
 
             if args.display:
-                cv2.imshow("ONNX vs RKNN", combined)
+                cv2.imshow(window_title, combined)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
     finally:
@@ -396,10 +476,15 @@ def main() -> None:
         cv2.destroyAllWindows()
 
     print(f"[INFO] Saved {frame_count} frames to {args.output}")
-    write_det_count_csv(count_csv, onnx_det_counts, rknn_det_counts)
+    if rknn_only:
+        write_det_count_csv(count_csv, [], rknn_det_counts)
+    else:
+        write_det_count_csv(count_csv, onnx_det_counts, rknn_det_counts)
     print(f"[INFO] Saved per-frame bbox counts to {count_csv}")
-    print_speed_summary(onnx_ms_values, rknn_ms_values, rknn_label)
-    print_det_count_summary(onnx_det_counts, rknn_det_counts, rknn_label)
+    print_speed_summary(onnx_ms_values, rknn_ms_values, rknn_label, rknn_only=rknn_only)
+    print_det_count_summary(
+        onnx_det_counts, rknn_det_counts, rknn_label, rknn_only=rknn_only
+    )
 
 
 if __name__ == "__main__":
