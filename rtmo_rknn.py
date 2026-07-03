@@ -678,7 +678,7 @@ class RTMO_RKNN:
         quant = _detect_rknn_quant(self.model_path)
         ret = rknn.config(
             mean_values=[[0, 0, 0]],
-            std_values=[[255, 255, 255]],
+            std_values=[[1, 1, 1]],
             target_platform=self.target,
             output_optimize=False,
         )
@@ -763,8 +763,9 @@ class RTMO_RKNN:
         if self.backend == "onnx" or self.rknn is None:
             return
 
-        # RKNN models here are converted with mean=[0,0,0], std=[255,255,255].
-        # rknnlite expects uint8 4D NHWC and applies normalization internally.
+        # RKNN models here are converted with mean=[0,0,0], std=[1,1,1] so uint8
+        # pixels pass through as float 0–255 (matching ONNX). rknnlite expects
+        # uint8 4D NHWC and applies mean/std from conversion internally.
         self._rknn_input_layout = "nhwc"
         self._rknn_input_dtype = np.uint8
         self._rknn_input_pass_through = False

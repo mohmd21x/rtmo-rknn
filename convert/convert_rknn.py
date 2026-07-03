@@ -154,9 +154,12 @@ def main() -> None:
     rknn = RKNN(verbose=True)
     try:
         print(f"[INFO] Configuring RKNN for target={args.target}")
+        # RTMO ONNX expects float NCHW in 0–255 (no /255). RKNN uint8 input with
+        # mean=0, std=1 passes pixel values through as float 0–255 internally.
+        # Do NOT use std=255 here — that scales to 0–1 and kills detection scores.
         config_kwargs: dict = dict(
             mean_values=[[0, 0, 0]],
-            std_values=[[255, 255, 255]],
+            std_values=[[1, 1, 1]],
             target_platform=args.target,
         )
         if args.keep_float_io:
