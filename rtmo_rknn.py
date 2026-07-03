@@ -532,19 +532,24 @@ def _log_top_scores(
         )
 
 
+def _to_float32(arr: np.ndarray) -> np.ndarray:
+    """RKNN may return float16 outputs for hybrid INT8 models."""
+    return np.asarray(arr, dtype=np.float32)
+
+
 def _parse_no_nms_output_dict(
     parsed: Dict[str, np.ndarray],
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     if len(parsed) == 5:
-        bboxes_raw = np.asarray(parsed["bboxes"], dtype=np.float32).reshape(-1, 4)
-        scores_raw = np.asarray(parsed["scores"], dtype=np.float32).reshape(-1)
-        pose_vecs = np.asarray(parsed["pose_vecs"], dtype=np.float32).reshape(
+        bboxes_raw = _to_float32(parsed["bboxes"]).reshape(-1, 4)
+        scores_raw = _to_float32(parsed["scores"]).reshape(-1)
+        pose_vecs = _to_float32(parsed["pose_vecs"]).reshape(
             bboxes_raw.shape[0], -1
         )
-        kpt_vis = np.asarray(parsed["kpt_vis"], dtype=np.float32).reshape(
+        kpt_vis = _to_float32(parsed["kpt_vis"]).reshape(
             bboxes_raw.shape[0], NUM_KEYPOINTS
         )
-        priors = np.asarray(parsed["priors"], dtype=np.float32).reshape(
+        priors = _to_float32(parsed["priors"]).reshape(
             bboxes_raw.shape[0], 2
         )
         sort_indices = _cpu_topk_sort_indices(scores_raw)
@@ -561,15 +566,15 @@ def _parse_no_nms_output_dict(
             "Re-export with convert/export_no_nms.py."
         )
 
-    bboxes = np.asarray(parsed["bboxes"], dtype=np.float32).reshape(-1, 4)
-    scores = np.asarray(parsed["scores"], dtype=np.float32).reshape(-1)
-    pose_vecs = np.asarray(parsed["pose_vecs"], dtype=np.float32).reshape(
+    bboxes = _to_float32(parsed["bboxes"]).reshape(-1, 4)
+    scores = _to_float32(parsed["scores"]).reshape(-1)
+    pose_vecs = _to_float32(parsed["pose_vecs"]).reshape(
         bboxes.shape[0], -1
     )
-    kpt_vis = np.asarray(parsed["kpt_vis"], dtype=np.float32).reshape(
+    kpt_vis = _to_float32(parsed["kpt_vis"]).reshape(
         bboxes.shape[0], NUM_KEYPOINTS
     )
-    priors = np.asarray(parsed["priors"], dtype=np.float32).reshape(
+    priors = _to_float32(parsed["priors"]).reshape(
         bboxes.shape[0], 2
     )
     sort_indices = np.asarray(parsed["sort_indices"], dtype=np.int64).reshape(-1)

@@ -91,7 +91,8 @@ bash convert/convert_all.sh
 
 Notes:
 - Always convert from the **no-NMS** ONNX produced in step 1, not the original `rtmo/*.onnx`.
-- INT8 conversion auto-builds a `dataset.txt` from images in `sample-data`.
+- INT8 uses **hybrid quantization** by default (`--int8_mode hybrid`): bbox/prior heads stay fp16 because full INT8 breaks bbox regression on RK3588 NPU. Letterboxed 640×640 images are used for calibration.
+- Plain full INT8 (`--int8_mode plain`) is available but not recommended on device.
 - RKNN conversion uses `mean=[0,0,0]`, `std=[1,1,1]` so runtime `uint8` NHWC input is passed as float 0–255 (same as ONNX). Do not use `std=255` (that wrongly scales to 0–1).
 - Converter uses fixed static input shape `1x3x640x640`.
 

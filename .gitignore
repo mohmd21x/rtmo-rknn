@@ -52,7 +52,12 @@ venv/
 # RKNN / ONNX build outputs (regenerate with convert/)
 convert/no_nms_onnx/
 convert/models/dataset.txt
+convert/models/calib_letterbox/
+convert/models/*.cfg
+convert/models/*.model
+convert/models/*.data
 convert/**/*.tmp
+rtmo-*-no-nms.*
 
 # Pre-built RKNN models (tracked — whitelist below)
 !convert/models/

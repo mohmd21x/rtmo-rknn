@@ -23,13 +23,18 @@ for model in rtmo-s rtmo-m; do
     input_model="${NO_NMS_DIR}/${model}-no-nms.onnx"
     output_model="${OUT_DIR}/${model}.${quant}.rknn"
     echo "[INFO] Converting ${model} (${quant}) -> ${output_model}"
+    extra_args=()
+    if [[ "${quant}" == "int8" ]]; then
+      extra_args+=(--int8_mode hybrid)
+    fi
     python "${CONVERT_SCRIPT}" \
       --model "${input_model}" \
       --output "${output_model}" \
       --quant "${quant}" \
       --target "${TARGET}" \
       --keep_float_io \
-      --sample_data "${SAMPLE_DATA}"
+      --sample_data "${SAMPLE_DATA}" \
+      "${extra_args[@]}"
   done
 done
 
