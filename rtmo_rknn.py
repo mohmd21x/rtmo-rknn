@@ -494,6 +494,44 @@ def _cpu_topk_sort_indices(scores: np.ndarray) -> np.ndarray:
     return np.argsort(-scores_flat, kind="stable").astype(np.int64)
 
 
+def _log_array_stats(label: str, arr: np.ndarray) -> None:
+    data = np.asarray(arr)
+    flat = data.reshape(-1)
+    finite = flat[np.isfinite(flat)] if flat.size else flat
+    if finite.size == 0:
+        print(f"[TRACE] {label}: shape={data.shape} (empty or all non-finite)")
+        return
+    print(
+        f"[TRACE] {label}: shape={data.shape} dtype={data.dtype} "
+        f"min={float(finite.min()):.6f} max={float(finite.max()):.6f} "
+        f"mean={float(finite.mean()):.6f} "
+        f"p50={float(np.percentile(finite, 50)):.6f} "
+        f"p99={float(np.percentile(finite, 99)):.6f}"
+    )
+
+
+def _log_top_scores(
+    scores: np.ndarray,
+    bboxes: np.ndarray,
+    *,
+    prefix: str,
+    top_k: int = 10,
+) -> None:
+    scores_flat = np.asarray(scores, dtype=np.float32).reshape(-1)
+    boxes = np.asarray(bboxes, dtype=np.float32).reshape(-1, 4)
+    if scores_flat.size == 0:
+        print(f"[TRACE] {prefix}: no scores")
+        return
+    order = np.argsort(-scores_flat)[:top_k]
+    print(f"[TRACE] {prefix} top-{min(top_k, order.size)}:")
+    for rank, idx in enumerate(order, start=1):
+        bb = boxes[idx]
+        print(
+            f"  #{rank:2d} idx={idx:4d} score={scores_flat[idx]:.4f} "
+            f"bbox=[{bb[0]:.1f},{bb[1]:.1f},{bb[2]:.1f},{bb[3]:.1f}]"
+        )
+
+
 def _parse_no_nms_output_dict(
     parsed: Dict[str, np.ndarray],
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -960,6 +998,108 @@ class RTMO_RKNN:
 
         keypoints = np.stack(keypoints, axis=0)
         return final_boxes, final_scores, keypoints, final_kpt_vis
+
+    def diagnose(
+        self, image: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Run inference with detailed stdout trace (for zero-detection debugging)."""
+        print("\n=== RTMO_RKNN diagnose ===")
+        print(
+            f"[TRACE] model={self.model_path} backend={self.backend} "
+            f"nms_score>={self.nms_score_threshold} final_score>={self.score_threshold} "
+            f"nms_iou={self.nms_iou} decoder_in={self.decoder.in_channels}"
+        )
+        img = np.asarray(image)
+        print(
+            f"[TRACE] input image: shape={img.shape} dtype={img.dtype} "
+            f"min={int(img.min())} max={int(img.max())} mean={float(img.mean()):.1f}"
+        )
+
+        preprocessed, ratio = self.preprocess(img)
+        print(
+            f"[TRACE] letterbox ratio={ratio:.4f} "
+            f"content~{int(img.shape[1] * ratio)}x{int(img.shape[0] * ratio)} "
+            f"in 640x640"
+        )
+        _log_array_stats("preprocessed uint8", preprocessed)
+
+        outputs = self.inference(preprocessed)
+        output_names = (
+            self.onnx_output_names
+            if self.backend == "onnx"
+            else ["bboxes", "scores", "pose_vecs", "kpt_vis", "priors", "sort_indices"]
+        )
+        print(f"[TRACE] rknn outputs: {len(outputs)} tensors")
+        for i, out in enumerate(outputs):
+            name = output_names[i] if i < len(output_names) else f"out{i}"
+            _log_array_stats(f"raw output[{i}] {name}", out)
+
+        parsed = _outputs_to_dict(
+            outputs,
+            self.onnx_output_names if self.backend == "onnx" else None,
+        )
+        print(f"[TRACE] parsed output keys ({len(parsed)}): {list(parsed.keys())}")
+
+        if len(parsed) == 5:
+            scores_raw = np.asarray(parsed["scores"], dtype=np.float32).reshape(-1)
+            bboxes_raw = np.asarray(parsed["bboxes"], dtype=np.float32).reshape(-1, 4)
+            _log_array_stats("scores before CPU TopK", scores_raw)
+            _log_top_scores(scores_raw, bboxes_raw, prefix="before TopK")
+            ge_nms_raw = int(np.sum(scores_raw >= self.nms_score_threshold))
+            ge_final_raw = int(np.sum(scores_raw >= self.score_threshold))
+            print(
+                f"[TRACE] raw anchors >={self.nms_score_threshold}: {ge_nms_raw} | "
+                f">={self.score_threshold}: {ge_final_raw}"
+            )
+
+        bboxes, scores, pose_vecs, kpt_vis, _priors, sort_indices = (
+            _parse_no_nms_output_dict(parsed)
+        )
+        _log_array_stats("scores after TopK sort", scores)
+        _log_top_scores(scores, bboxes, prefix="after TopK")
+        ge_nms = int(np.sum(scores >= self.nms_score_threshold))
+        ge_final = int(np.sum(scores >= self.score_threshold))
+        print(
+            f"[TRACE] sorted anchors >={self.nms_score_threshold}: {ge_nms} | "
+            f">={self.score_threshold}: {ge_final}"
+        )
+
+        nms_kept = _nms_xyxy(
+            bboxes,
+            scores,
+            self.nms_score_threshold,
+            self.nms_iou,
+            self.nms_max,
+        )
+        kept = [idx for idx in nms_kept if scores[idx] >= self.score_threshold]
+        print(
+            f"[TRACE] NMS kept {len(nms_kept)} (pre-score-filter) -> "
+            f"final {len(kept)} after score>={self.score_threshold}"
+        )
+        if nms_kept and not kept:
+            print(
+                "[TRACE] NMS found boxes but all below final score_threshold. "
+                "Try --score_threshold 0.15 or inspect top scores above."
+            )
+            near = sorted(
+                ((int(i), float(scores[i])) for i in nms_kept),
+                key=lambda x: -x[1],
+            )[:5]
+            for idx, sc in near:
+                bb = bboxes[idx]
+                print(
+                    f"  nms idx={idx} score={sc:.4f} "
+                    f"bbox=[{bb[0]:.1f},{bb[1]:.1f},{bb[2]:.1f},{bb[3]:.1f}]"
+                )
+
+        if not kept:
+            for thr in (0.05, 0.15, 0.25, 0.3):
+                n = int(np.sum(scores >= thr))
+                print(f"[TRACE] sorted anchors >={thr}: {n}")
+
+        print("=== end diagnose ===\n")
+        bboxes, bbox_scores, keypoints, kpt_scores = self.postprocess(outputs, ratio)
+        return image.copy(), bboxes, bbox_scores, keypoints, kpt_scores
 
     def __call__(
         self, image: np.ndarray
