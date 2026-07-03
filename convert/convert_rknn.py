@@ -10,37 +10,41 @@ import numpy as np
 import onnx
 from rknn.api import RKNN
 
-# Semantic bbox/prior tensors to keep in fp16 during hybrid INT8 (names differ per model).
-_HYBRID_FP16_EXACT = frozenset(
-    {
-        "flatten_bbox_preds-rs_tp",
-        "flatten_bbox_preds-rs",
-        "bboxes-rs",
-        "bboxes",
-        "priors-rs",
-        "priors",
-    }
-)
+
+def _parse_quantize_parameter_names(cfg_text: str) -> List[str]:
+    """Top-level quantize_parameters keys (4-space indent, not 8-space fields)."""
+    names: List[str] = []
+    for line in cfg_text.splitlines():
+        if line.startswith("        "):
+            continue
+        match = re.match(r"^    ([^\s].+):\s*$", line)
+        if match:
+            names.append(match.group(1))
+    return names
 
 
 def discover_hybrid_fp16_layers(cfg_text: str) -> List[str]:
-    """Pick bbox-regression tensors present in this model's quantization cfg."""
-    found: List[str] = []
-    for line in cfg_text.splitlines():
-        match = re.match(r"^    ([^:\s][^:]*):\s*$", line)
-        if not match:
-            continue
-        name = match.group(1)
-        if name in _HYBRID_FP16_EXACT:
-            found.append(name)
-        elif name.startswith("onnx::Mul_") and name.endswith("-rs"):
-            found.append(name)
-    if not found:
+    """Keep the full bbox/prior decode chain in fp16 (INT8 breaks on RK3588 NPU)."""
+    names = _parse_quantize_parameter_names(cfg_text)
+    start_names = ("flatten_bbox_preds-rs_tp", "flatten_bbox_preds-rs")
+    start = -1
+    for key in start_names:
+        if key in names:
+            start = names.index(key)
+            break
+    if start < 0:
         raise RuntimeError(
-            "Could not find bbox/prior tensors in hybrid quantization cfg. "
-            "Check export_no_nms.py output names."
+            "flatten_bbox_preds-rs(_tp) not found in hybrid quantization cfg."
         )
-    return found
+    try:
+        end = names.index("bboxes")
+    except ValueError as exc:
+        raise RuntimeError("bboxes output not found in hybrid quantization cfg.") from exc
+    layer_names = names[start : end + 1]
+    for extra in ("priors-rs", "priors"):
+        if extra in names and extra not in layer_names:
+            layer_names.append(extra)
+    return layer_names
 
 
 def patch_hybrid_quant_cfg(cfg_text: str) -> str:

@@ -409,6 +409,37 @@ def _iou_xyxy(a: np.ndarray, b: np.ndarray) -> float:
     return inter / union
 
 
+def _is_plausible_detection_box(
+    box: np.ndarray, input_size: Tuple[int, int] = (640, 640)
+) -> bool:
+    """Drop quantized false positives with off-canvas boxes (common INT8 artifact)."""
+    x1, y1, x2, y2 = box
+    h_lim, w_lim = input_size
+    w = float(x2 - x1)
+    h = float(y2 - y1)
+    if w < 12.0 or h < 12.0:
+        return False
+    if x1 < -0.1 * w_lim or y1 < -0.1 * h_lim:
+        return False
+    if x2 > 1.1 * w_lim or y2 > 1.1 * h_lim:
+        return False
+    cx = 0.5 * (x1 + x2)
+    cy = 0.5 * (y1 + y2)
+    if cx < 0.0 or cy < 0.0 or cx > w_lim or cy > h_lim:
+        return False
+    return True
+
+
+def _scores_for_nms(
+    scores: np.ndarray, bboxes: np.ndarray, input_size: Tuple[int, int]
+) -> np.ndarray:
+    masked = np.asarray(scores, dtype=np.float32).copy()
+    for idx in range(masked.shape[0]):
+        if not _is_plausible_detection_box(bboxes[idx], input_size):
+            masked[idx] = 0.0
+    return masked
+
+
 def _nms_xyxy_numpy(
     boxes: np.ndarray,
     scores: np.ndarray,
@@ -970,9 +1001,10 @@ class RTMO_RKNN:
         # is an offset bbox tensor and must not be used here.
         flatten_priors = self.decoder.flatten_priors_640.reshape(-1, 2)
 
+        nms_scores = _scores_for_nms(bboxes, scores, self.model_input_size)
         nms_kept = _nms_xyxy(
             bboxes,
-            scores,
+            nms_scores,
             self.nms_score_threshold,
             self.nms_iou,
             self.nms_max,
@@ -1070,9 +1102,16 @@ class RTMO_RKNN:
             f">={self.score_threshold}: {ge_final}"
         )
 
+        nms_scores = _scores_for_nms(bboxes, scores, self.model_input_size)
+        plausible = int(np.sum(nms_scores >= self.nms_score_threshold))
+        if plausible < ge_nms:
+            print(
+                f"[TRACE] plausible-box filter: {ge_nms - plausible} high-score "
+                f"anchors dropped (off-canvas / invalid INT8 boxes)"
+            )
         nms_kept = _nms_xyxy(
             bboxes,
-            scores,
+            nms_scores,
             self.nms_score_threshold,
             self.nms_iou,
             self.nms_max,
