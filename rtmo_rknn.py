@@ -413,7 +413,8 @@ def _is_plausible_detection_box(
     box: np.ndarray, input_size: Tuple[int, int] = (640, 640)
 ) -> bool:
     """Drop quantized false positives with off-canvas boxes (common INT8 artifact)."""
-    x1, y1, x2, y2 = box
+    coords = np.asarray(box, dtype=np.float32).reshape(4)
+    x1, y1, x2, y2 = coords
     h_lim, w_lim = input_size
     w = float(x2 - x1)
     h = float(y2 - y1)
@@ -1001,7 +1002,7 @@ class RTMO_RKNN:
         # is an offset bbox tensor and must not be used here.
         flatten_priors = self.decoder.flatten_priors_640.reshape(-1, 2)
 
-        nms_scores = _scores_for_nms(bboxes, scores, self.model_input_size)
+        nms_scores = _scores_for_nms(scores, bboxes, self.model_input_size)
         nms_kept = _nms_xyxy(
             bboxes,
             nms_scores,
@@ -1102,7 +1103,7 @@ class RTMO_RKNN:
             f">={self.score_threshold}: {ge_final}"
         )
 
-        nms_scores = _scores_for_nms(bboxes, scores, self.model_input_size)
+        nms_scores = _scores_for_nms(scores, bboxes, self.model_input_size)
         plausible = int(np.sum(nms_scores >= self.nms_score_threshold))
         if plausible < ge_nms:
             print(
